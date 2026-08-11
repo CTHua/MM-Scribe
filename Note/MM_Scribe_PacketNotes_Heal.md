@@ -2,12 +2,11 @@
 
 | 項目 | 內容 |
 |------|------|
-| 版本 | 2026-08-09 (rev.4 — 加入 Skill ID 提取交叉引用) |
-| 樣本來源 | `WS-治癒.json`（生命連結對敵，自癒 +15）、`WS-治癒隊友.json`（生命連結對 B +10 → 防護對 A+B 各 +15）、`WS1-找護盾.json`（unfiltered，含防護 cast frame 364） |
-| 依據報告 | `PACKET_FORMAT_REPORT.md`（本文為其 §4 治癒章節的修訂 + 護盾新增） |
+| 版本 | 2026-08-09 (rev.4) |
+| 樣本來源 | 生命連結對敵（自癒 +15）、生命連結對 B +10 → 防護對 A+B 各 +15、防護施放（含護盾 cast frame 364） |
 | 適用 | 治療 / 護盾事件解析與 HPS 統計（Python 版 MM Scribe） |
 
-本文**取代**原報告 §4 對治癒的描述，並新增護盾章節。原「配對 dedupe」邏輯不再使用。
+原「配對 dedupe」邏輯不再使用。
 
 ---
 
@@ -228,13 +227,11 @@ b3 b1 01 00  18 00 00 00           # cmd 0x0001B1B3, size 24
 
 ---
 
-## 9. Skill ID 提取（引用外部規格）
+## 9. Skill ID 提取
 
-治療（`0x5029`）與護盾增量（`0x4EED`）本身**不含 Skill ID**。取得 Skill ID 的規格詳見另一份文件：
+治療（`0x5029`）與護盾增量（`0x4EED`）本身**不含 Skill ID**，需另外從同 payload 內的 skill TLV 掃描取得。
 
-**[HEAL_SHIELD_SKILL_ID.md](HEAL_SHIELD_SKILL_ID.md)**
-
-### 9.1 規格摘要
+### 9.1 掃描規則
 
 - 對每一筆 `0x5029` 或 `0x4EED`，在**同一 TCP payload** 內做雙向 Near scan（±300 bytes）尋找 skill TLV
 - 兩種 skill TLV 皆帶 Skill ID 於 header+25：
@@ -243,26 +240,16 @@ b3 b1 01 00  18 00 00 00           # cmd 0x0001B1B3, size 24
 - 排名：距離最小者勝，平手偏 after
 - 無候選 → Skill ID 為 `null`（不捏造、不從傷害 TLV 借用）
 
-### 9.2 與本筆記的分工
-
-| 職責 | 文件 |
-|---|---|
-| 治療 / 護盾事件本身的欄位與計數規則 | 本筆記 |
-| Skill ID 提取的掃描 / 排名 / anti-decoy | HEAL_SHIELD_SKILL_ID.md |
-| 事件與 Skill ID 的關聯（誰治了誰、用什麼技能）| 上游組合層 |
-
-### 9.3 開放問題：`0x1ADEA` 是否也是 tick-side skill TLV？
+### 9.2 開放問題：`0x1ADEA` 是否也是 tick-side skill TLV？
 
 觀察：治療 tick 封包（例如 frame 24 生命連結 +10 to B）內含 **`0x0001ADEA`**（末位 `EA`）而非 `0x0001ADE8`（末位 `E8`）。結構同 size 36，header+25 位置可讀出一個 uint32（frame 24 樣本為 `0x3D36850A`）。
 
-- 若 `0x1ADEA` 是「tick 版動作事件」且 +25 為 skill / effect ID → 應納入 HEAL_SHIELD_SKILL_ID.md §3 作為第三個候選格式
+- 若 `0x1ADEA` 是「tick 版動作事件」且 +25 為 skill / effect ID → 應納入 §9.1 作為第三個候選格式
 - 若不是 → 明確排除，避免誤匹配
 
 **待驗證方式**：對比不同技能（例如生命連結 tick / 綁帶 / 食物）的 tick 封包 `0x1ADEA` +25 值，看是否隨技能變動：
 - 隨技能變 → 是 skill / effect ID
 - 恆定或隨其他因素變 → 不是
-
-此驗證屬 Skill ID 規格範疇；若確認，需回頭更新 HEAL_SHIELD_SKILL_ID.md，本筆記不重複描述。
 
 ---
 
