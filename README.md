@@ -47,18 +47,69 @@
 
 ### macOS
 
-- macOS 13 以上（Apple Silicon / Intel）
+- macOS 13 以上，**Apple Silicon**（遊戲本身是 iOS App on Mac，無法在 Intel Mac 上執行）
 - libpcap 為系統內建，**不需要**安裝 Npcap 之類的驅動
-- 抓包需要 BPF 裝置權限，二選一：
-  - 安裝 [Wireshark](https://www.wireshark.org/) 內附的 **ChmodBPF**（一次設定，之後免 sudo）
-  - 或以 `sudo` 執行
-- Python 3.12 與相依套件：`customtkinter`、`scapy`
+- 抓包需要 BPF 裝置權限（見下方使用說明）
+- 原始碼版另需 Python 3.12 與相依套件：`customtkinter`、`scapy`
 
 遊戲在 macOS 上是透過 App Store 安裝的 **iOS App on Mac**，
 封包直接走實體網卡，不需要模擬器、網路共享或任何轉送設定。
 封包格式與 Windows 端相同，解析邏輯共用。
 
-#### 快速開始
+---
+
+## macOS 使用說明
+
+### 1. 解除 Apple 的安全性阻擋
+
+首次開啟 `MM Scribe.app` 時，macOS 會跳出：
+
+> **Apple 無法驗證「MM Scribe」是否為惡意軟體，它可能會損害你的 Mac 或危害你的隱私權。**
+
+這是因為本工具沒有經過 Apple 公證（notarization）—— 那需要付費的 Apple Developer 帳號。
+這個提示不代表程式有問題，但也請自行判斷來源是否可信。
+
+**方法 A：終端機一行解決（推薦，所有 macOS 版本通用）**
+
+```bash
+xattr -dr com.apple.quarantine "/Applications/MM Scribe.app"
+```
+
+`com.apple.quarantine` 是檔案從網路下載時被貼上的標記，移除後就不會再被攔。
+路徑請換成 `.app` 實際存放的位置。
+
+**方法 B：從系統設定允許**
+
+1. 在警告對話框點「**完成**」（不要點「移到垃圾桶」）
+2. 開啟「**系統設定**」→「**隱私權與安全性**」
+3. 捲到最下方的「**安全性**」區段，會看到「已阻擋使用『MM Scribe』…」
+4. 點「**仍要打開**」，再確認一次並輸入密碼
+
+> macOS 15 Sequoia 起，Apple 已移除舊版「按住 Control 點按 →『打開』」的繞過方式，
+> 必須改走上述系統設定的流程。
+
+### 2. 授予抓包權限
+
+抓封包需要讀取 `/dev/bpf*`，它預設只有 root 能存取。二選一：
+
+**免 sudo（推薦）**：安裝 [Wireshark](https://www.wireshark.org/) 內附的 **ChmodBPF**
+（在 Wireshark 的 dmg 裡，安裝一次即可，之後每次開機自動生效）。
+
+**或以 sudo 啟動**：`.app` 沒有「以管理員身分執行」這種選項，需從終端機啟動：
+
+```bash
+sudo "/Applications/MM Scribe.app/Contents/MacOS/MM Scribe"
+```
+
+### 3. 開始使用
+
+1. 先開好遊戲並登入
+2. 啟動 MM Scribe，程式會自動偵測收包網卡（通常兩秒內完成並選到 Wi-Fi 那張）
+3. 按「開始」，然後進遊戲打怪，傷害統計就會即時跳動
+
+若一直沒有數據，點「設定」→「網路檢測」可以逐項確認權限、驅動與網卡狀態。
+
+### 從原始碼執行
 
 ```bash
 uv venv --python 3.12 .venv
@@ -67,6 +118,7 @@ uv pip install --python .venv/bin/python scapy==2.7.0 customtkinter==5.2.2
 ```
 
 `run-macos.sh` 會自動判斷是否需要提權，並處理 uv 版 Python 的 Tcl/Tk 路徑問題。
+直接跑原始碼不會遇到上面第 1 點的 Gatekeeper 問題。
 
 ---
 
@@ -134,7 +186,10 @@ touch RELEASE.marker
 python -m PyInstaller --windowed --collect-data customtkinter --add-data "RELEASE.marker:." MabinogiMobileScribe_Beta_V0.43.py
 ```
 
-未經簽章與公證的 `.app` 會被 Gatekeeper 攔下，首次開啟需右鍵 →「打開」。
+PyInstaller 只會做 ad-hoc 簽章（沒有 Team ID），因此 `.app` 一定會被 Gatekeeper 攔下，
+使用者需依「[macOS 使用說明](#macos-使用說明)」第 1 點解除。要根治得有付費的 Apple
+Developer 帳號做簽章與公證。
+
 另外 `.app` 沒有「以系統管理員身分執行」這種選項，所以發布版建議搭配 ChmodBPF，
 否則使用者只能從終端機以 `sudo` 啟動。
 
