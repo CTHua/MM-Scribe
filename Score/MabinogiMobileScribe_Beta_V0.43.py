@@ -343,7 +343,10 @@ def check_capture_permission():
             if not os.path.exists(path):
                 continue
             try:
-                os.close(os.open(path, os.O_RDONLY))
+                # 必須用 O_RDWR:scapy 的 get_dev_bpf() 就是這樣開的。
+                # 只用 O_RDONLY 測的話,權限若設成唯讀會誤判為可用,
+                # 但實際 sniff 仍會失敗 — 那種狀況極難除錯。
+                os.close(os.open(path, os.O_RDWR))
                 return True, "BPF 裝置可直接存取 (已套用 ChmodBPF)"
             except PermissionError:
                 break

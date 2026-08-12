@@ -37,7 +37,7 @@ for i in range(4):
     p = f"/dev/bpf{i}"
     if os.path.exists(p):
         try:
-            os.close(os.open(p, os.O_RDONLY))
+            os.close(os.open(p, os.O_RDWR))  # 與 scapy 的 get_dev_bpf() 一致
             sys.exit(0)
         except PermissionError:
             sys.exit(1)
