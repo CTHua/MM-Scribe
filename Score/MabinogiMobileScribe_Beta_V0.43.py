@@ -25,6 +25,11 @@ import webbrowser
 import customtkinter as ctk
 from scapy.all import sniff, TCP, IP
 
+# 字體:UI 文字用中文字型,數值欄位用等寬字型
+# (傷害欄靠等寬字才能對齊 Text widget 的固定 tab stop)
+FONT_UI = "Microsoft JhengHei"
+FONT_MONO = "Consolas"
+
 
 def is_release_build():
     """判定是否為 release 打包版。
@@ -338,9 +343,9 @@ class LiveDamageMonitor:
         # 同一套字體/縮放管線 (widget_scaling × DPI scaling 都會自動套用),
         # 兩邊視覺大小一致。共用同一份 font instance,scale 變更時 CTk 會自動更新。
         self._skill_name_font = ctk.CTkFont(
-            family="Microsoft JhengHei", size=12, weight="bold")
+            family=FONT_UI, size=12, weight="bold")
         self._skill_value_font = ctk.CTkFont(
-            family="Consolas", size=12, weight="bold")
+            family=FONT_MONO, size=12, weight="bold")
 
         # Resize debounce: 拖窗期間暫停技能排行更新,停下 150ms 後補一次
         self._is_resizing = False
@@ -395,20 +400,20 @@ class LiveDamageMonitor:
         left_stats = ctk.CTkFrame(main_row, corner_radius=0, fg_color="transparent")
         left_stats.pack(side="left", expand=True, fill="x", padx=10, pady=(8, 4))
         ctk.CTkLabel(left_stats, text="累積傷害",
-                     font=("Microsoft JhengHei", 12, "bold"),
+                     font=(FONT_UI, 12, "bold"),
                      text_color="#888888").pack()
         self.lbl_total_dmg = ctk.CTkLabel(left_stats, text="0",
-                                          font=("Consolas", 24, "bold"),
+                                          font=(FONT_MONO, 24, "bold"),
                                           text_color="#ff4d4d")
         self.lbl_total_dmg.pack(pady=(2, 0))
 
         right_stats = ctk.CTkFrame(main_row, corner_radius=0, fg_color="transparent")
         right_stats.pack(side="right", expand=True, fill="x", padx=10, pady=(8, 4))
         ctk.CTkLabel(right_stats, text="DPS (每秒傷害)",
-                     font=("Microsoft JhengHei", 12, "bold"),
+                     font=(FONT_UI, 12, "bold"),
                      text_color="#888888").pack()
         self.lbl_dps = ctk.CTkLabel(right_stats, text="0",
-                                    font=("Consolas", 24, "bold"),
+                                    font=(FONT_MONO, 24, "bold"),
                                     text_color="#ffcc4d")
         self.lbl_dps.pack(pady=(2, 0))
 
@@ -421,10 +426,10 @@ class LiveDamageMonitor:
             col = ctk.CTkFrame(cov_row, fg_color="transparent")
             col.pack(side="left", expand=True, fill="x", padx=4)
             ctk.CTkLabel(col, text=f"{tag_name}覆蓋率",
-                         font=("Microsoft JhengHei", 12, "bold"),
+                         font=(FONT_UI, 12, "bold"),
                          text_color="#888888").pack()
             lbl = ctk.CTkLabel(col, text="—",
-                               font=("Consolas", 16, "bold"),
+                               font=(FONT_MONO, 16, "bold"),
                                text_color="#88ccff")
             lbl.pack()
             self.lbl_cov[tag_name] = lbl
@@ -440,10 +445,10 @@ class LiveDamageMonitor:
         heal_total_col = ctk.CTkFrame(heal_total_row, fg_color="transparent")
         heal_total_col.pack(expand=True, fill="x", padx=10, pady=(8, 4))
         ctk.CTkLabel(heal_total_col, text="治癒總量",
-                     font=("Microsoft JhengHei", 12, "bold"),
+                     font=(FONT_UI, 12, "bold"),
                      text_color="#888888").pack()
         self.lbl_heal_total = ctk.CTkLabel(heal_total_col, text="0",
-                                            font=("Consolas", 24, "bold"),
+                                            font=(FONT_MONO, 24, "bold"),
                                             text_color="#4dd471")
         self.lbl_heal_total.pack(pady=(2, 0))
 
@@ -453,19 +458,19 @@ class LiveDamageMonitor:
         self_col = ctk.CTkFrame(heal_sub_row, fg_color="transparent")
         self_col.pack(side="left", expand=True, fill="x", padx=4)
         ctk.CTkLabel(self_col, text="自身治癒",
-                     font=("Microsoft JhengHei", 11, "bold"),
+                     font=(FONT_UI, 11, "bold"),
                      text_color="#888888").pack()
         self.lbl_heal_self = ctk.CTkLabel(self_col, text="0",
-                                           font=("Consolas", 16, "bold"),
+                                           font=(FONT_MONO, 16, "bold"),
                                            text_color="#4dd471")
         self.lbl_heal_self.pack()
         ally_col = ctk.CTkFrame(heal_sub_row, fg_color="transparent")
         ally_col.pack(side="left", expand=True, fill="x", padx=4)
         ctk.CTkLabel(ally_col, text="隊友治癒",
-                     font=("Microsoft JhengHei", 11, "bold"),
+                     font=(FONT_UI, 11, "bold"),
                      text_color="#888888").pack()
         self.lbl_heal_ally = ctk.CTkLabel(ally_col, text="0",
-                                           font=("Consolas", 16, "bold"),
+                                           font=(FONT_MONO, 16, "bold"),
                                            text_color="#88ccff")
         self.lbl_heal_ally.pack()
 
@@ -550,7 +555,7 @@ class LiveDamageMonitor:
         self._btn_timer_idle_hover = self.btn_timer.cget("hover_color")
 
         self.lbl_timer_remaining = ctk.CTkLabel(ctrl_row3, text="",
-                                                 font=("Consolas", 13, "bold"),
+                                                 font=(FONT_MONO, 13, "bold"),
                                                  text_color="#88ccff")
         self.lbl_timer_remaining.pack(side="left", padx=(0, 8), pady=6)
 
@@ -567,19 +572,19 @@ class LiveDamageMonitor:
         ctk.CTkButton(self.status_bar, text="💬 Discord",
                       width=90, height=22, corner_radius=6,
                       fg_color="#5865f2", hover_color="#4752c4",
-                      font=("Microsoft JhengHei", 10),
+                      font=(FONT_UI, 10),
                       command=self.open_discord).pack(side="left", padx=(8, 4), pady=2)
         ctk.CTkButton(self.status_bar, text="⚠ 免責聲明",
                       width=90, height=22, corner_radius=6,
                       fg_color="#4a4a4a", hover_color="#6a6a6a",
-                      font=("Microsoft JhengHei", 10),
+                      font=(FONT_UI, 10),
                       command=self.show_disclaimer).pack(side="left", padx=4, pady=2)
 
         # 右側:設定
         ctk.CTkButton(self.status_bar, text="⚙ 設定",
                       width=70, height=22, corner_radius=6,
                       fg_color="#4a4a4a", hover_color="#6a6a6a",
-                      font=("Microsoft JhengHei", 10),
+                      font=(FONT_UI, 10),
                       command=self.show_settings).pack(side="right", padx=(4, 8), pady=2)
 
         # ----------------------------------------------------
@@ -601,7 +606,7 @@ class LiveDamageMonitor:
         self.btn_heal_toggle = ctk.CTkButton(
             heal_header,
             text="▼ 治癒事件日誌",
-            font=("Microsoft JhengHei", 11, "bold"),
+            font=(FONT_UI, 11, "bold"),
             fg_color="transparent",
             hover_color="#2a2a2a",
             anchor="w",
@@ -612,7 +617,7 @@ class LiveDamageMonitor:
         self.btn_heal_toggle.pack(side="left", fill="x", expand=True)
 
         self.heal_log_area = ctk.CTkTextbox(self.heal_log_pane, wrap="word",
-                                             font=("Consolas", 13),
+                                             font=(FONT_MONO, 13),
                                              corner_radius=0)
         self.heal_log_area.pack(fill="both", expand=True, padx=6, pady=6)
         # 治療自己 (綠) / 治療他人 (藍) 顏色標籤
@@ -627,8 +632,8 @@ class LiveDamageMonitor:
         # ----------------------------------------------------
         self.dev_pane = ctk.CTkFrame(root, corner_radius=0)
         ctk.CTkLabel(self.dev_pane, text="🛠 開發者 Flag 診斷",
-                     font=("Microsoft JhengHei", 11, "bold")).pack(anchor="w", padx=10, pady=(6, 0))
-        self.dev_log_area = ctk.CTkTextbox(self.dev_pane, wrap="word", font=("Consolas", 12),
+                     font=(FONT_UI, 11, "bold")).pack(anchor="w", padx=10, pady=(6, 0))
+        self.dev_log_area = ctk.CTkTextbox(self.dev_pane, wrap="word", font=(FONT_MONO, 12),
                                            corner_radius=0, height=140)
         self.dev_log_area.pack(fill="both", expand=True, padx=6, pady=6)
         self.dev_log_area.configure(state="disabled")
@@ -690,7 +695,7 @@ class LiveDamageMonitor:
             self.log_pane,
             text=("▶ 即時攻擊事件日誌 (已折疊)" if self.log_collapsed
                   else "▼ 即時攻擊事件日誌"),
-            font=("Microsoft JhengHei", 11, "bold"),
+            font=(FONT_UI, 11, "bold"),
             fg_color="transparent",
             hover_color="#2a2a2a",
             anchor="w",
@@ -700,7 +705,7 @@ class LiveDamageMonitor:
         )
         self.btn_log_toggle.pack(fill="x", padx=6, pady=(6, 0))
         self.log_area = ctk.CTkTextbox(self.log_pane, wrap="word",
-                                        font=("Consolas", 13), corner_radius=0)
+                                        font=(FONT_MONO, 13), corner_radius=0)
         # 折疊狀態下不 pack log_area,由 toggle_log_collapse 處理
         if not self.log_collapsed:
             self.log_area.pack(fill="both", expand=True, padx=6, pady=6)
@@ -721,7 +726,7 @@ class LiveDamageMonitor:
             skill_header,
             text=("▶ 技能傷害排行 (已折疊)" if self.skill_collapsed
                   else "▼ 技能傷害排行"),
-            font=("Microsoft JhengHei", 11, "bold"),
+            font=(FONT_UI, 11, "bold"),
             fg_color="transparent",
             hover_color="#2a2a2a",
             anchor="w",
@@ -735,7 +740,7 @@ class LiveDamageMonitor:
             skill_header, text="合併同技能", variable=self.merge_var,
             command=self.update_skill_ranking,
             corner_radius=5, checkbox_width=18, checkbox_height=18,
-            font=("Microsoft JhengHei", 11),
+            font=(FONT_UI, 11),
         ).pack(side="right", padx=(6, 4))
         self.skill_scroll = ctk.CTkScrollableFrame(self.skill_pane,
                                                      corner_radius=0,
@@ -1007,11 +1012,11 @@ class LiveDamageMonitor:
         header = ctk.CTkFrame(overlay, fg_color="transparent", height=44)
         header.pack(fill="x", padx=12, pady=(12, 0))
         ctk.CTkLabel(header, text="🌐 網路環境檢測",
-                     font=("Microsoft JhengHei", 16, "bold"),
+                     font=(FONT_UI, 16, "bold"),
                      text_color="#4dccff").pack(side="left", padx=6)
         ctk.CTkButton(header, text="✕", width=32, height=32, corner_radius=16,
                       fg_color="#3a3a3a", hover_color="#c94a4a",
-                      font=("Consolas", 14, "bold"),
+                      font=(FONT_MONO, 14, "bold"),
                       command=self.hide_network_check).pack(side="right", padx=6)
         ctk.CTkButton(header, text="🔄 重新檢測", width=100, height=32,
                       corner_radius=8,
@@ -1024,7 +1029,7 @@ class LiveDamageMonitor:
 
         # 結果顯示區
         self._netcheck_result = ctk.CTkTextbox(overlay, wrap="word",
-                                                font=("Consolas", 11),
+                                                font=(FONT_MONO, 11),
                                                 corner_radius=0,
                                                 fg_color="#1a1a1a")
         self._netcheck_result.pack(fill="both", expand=True, padx=16, pady=12)
@@ -1037,7 +1042,7 @@ class LiveDamageMonitor:
         self._netcheck_result._textbox.tag_config("tag_active", foreground="#66ffa0")
         self._netcheck_result._textbox.tag_config("tag_header",
                                                    foreground="#ffffff",
-                                                   font=("Microsoft JhengHei", 12, "bold"))
+                                                   font=(FONT_UI, 12, "bold"))
 
         self._run_network_checks()
 
@@ -1393,11 +1398,11 @@ class LiveDamageMonitor:
         header = ctk.CTkFrame(overlay, fg_color="transparent", height=44)
         header.pack(fill="x", padx=12, pady=(12, 0))
         ctk.CTkLabel(header, text="⚠ 免責聲明",
-                     font=("Microsoft JhengHei", 16, "bold"),
+                     font=(FONT_UI, 16, "bold"),
                      text_color="#ff9944").pack(side="left", padx=6)
         ctk.CTkButton(header, text="✕", width=32, height=32, corner_radius=16,
                       fg_color="#3a3a3a", hover_color="#c94a4a",
-                      font=("Consolas", 14, "bold"),
+                      font=(FONT_MONO, 14, "bold"),
                       command=self.hide_disclaimer).pack(side="right", padx=6)
 
         # 內文區
@@ -1418,7 +1423,7 @@ class LiveDamageMonitor:
             "    若不同意,請立即停止使用並刪除本程式。\n"
         )
         textbox = ctk.CTkTextbox(overlay, wrap="word",
-                                 font=("Microsoft JhengHei", 12),
+                                 font=(FONT_UI, 12),
                                  corner_radius=8, fg_color="#1a1a1a")
         textbox.pack(fill="both", expand=True, padx=16, pady=12)
         textbox.insert("end", content)
@@ -1447,11 +1452,11 @@ class LiveDamageMonitor:
         header = ctk.CTkFrame(overlay, fg_color="transparent", height=44)
         header.pack(fill="x", padx=12, pady=(12, 0))
         ctk.CTkLabel(header, text="⚙ 設定",
-                     font=("Microsoft JhengHei", 16, "bold"),
+                     font=(FONT_UI, 16, "bold"),
                      text_color="#88ccff").pack(side="left", padx=6)
         ctk.CTkButton(header, text="✕", width=32, height=32, corner_radius=16,
                       fg_color="#3a3a3a", hover_color="#c94a4a",
-                      font=("Consolas", 14, "bold"),
+                      font=(FONT_MONO, 14, "bold"),
                       command=self.hide_settings).pack(side="right", padx=6)
 
         # 用 ScrollableFrame,視窗過矮時內容自動可捲 (原本用 CTkFrame 會被截掉)
@@ -1462,20 +1467,20 @@ class LiveDamageMonitor:
         section = ctk.CTkFrame(body, fg_color="transparent")
         section.pack(fill="x", padx=12, pady=(12, 4))
         ctk.CTkLabel(section, text="── 顯示 ──",
-                     font=("Microsoft JhengHei", 12, "bold"),
+                     font=(FONT_UI, 12, "bold"),
                      text_color="#ffffff", anchor="w").pack(fill="x", pady=(0, 8))
 
         # 字體縮放列
         scale_row = ctk.CTkFrame(section, fg_color="transparent")
         scale_row.pack(fill="x", pady=4)
         ctk.CTkLabel(scale_row, text="字體縮放:", width=90,
-                     font=("Microsoft JhengHei", 12),
+                     font=(FONT_UI, 12),
                      anchor="w").pack(side="left", padx=(0, 8))
         # 顯示當前倍率的 Entry (唯讀,只當顯示用) + 右側 ▲▼ 兩顆微型按鈕
         # 每次 ▲ / ▼ 步進 0.1,夾在 FONT_SCALE_MIN ~ FONT_SCALE_MAX 之間
         self._scale_entry = ctk.CTkEntry(
             scale_row, width=64, justify="center",
-            font=("Consolas", 13, "bold"), corner_radius=6,
+            font=(FONT_MONO, 13, "bold"), corner_radius=6,
         )
         self._scale_entry.insert(0, f"{self.font_scale:.1f}x")
         self._scale_entry.configure(state="readonly")
@@ -1486,13 +1491,13 @@ class LiveDamageMonitor:
         ctk.CTkButton(
             step_col, text="▲", width=22, height=14, corner_radius=3,
             fg_color="#4a4a4a", hover_color="#6a6a6a",
-            font=("Consolas", 9),
+            font=(FONT_MONO, 9),
             command=lambda: self._step_scale(0.1),
         ).pack(pady=(0, 1))
         ctk.CTkButton(
             step_col, text="▼", width=22, height=14, corner_radius=3,
             fg_color="#4a4a4a", hover_color="#6a6a6a",
-            font=("Consolas", 9),
+            font=(FONT_MONO, 9),
             command=lambda: self._step_scale(-0.1),
         ).pack()
 
@@ -1506,39 +1511,39 @@ class LiveDamageMonitor:
         # 提示:視窗尺寸不會自動跟著縮放,由使用者手動調整
         ctk.CTkLabel(section,
                      text="※ 縮放後如視窗過小,請手動拖曳邊緣調整尺寸",
-                     font=("Microsoft JhengHei", 10),
+                     font=(FONT_UI, 10),
                      text_color="#888888", anchor="w").pack(fill="x", pady=(8, 0))
 
         # 獨立視窗 (popout) 選項
         popout_row = ctk.CTkFrame(section, fg_color="transparent")
         popout_row.pack(fill="x", pady=(10, 0))
         ctk.CTkLabel(popout_row, text="獨立視窗:", width=90,
-                     font=("Microsoft JhengHei", 12),
+                     font=(FONT_UI, 12),
                      anchor="w").pack(side="left", padx=(0, 8))
         ctk.CTkCheckBox(
             popout_row, text="攻擊事件日誌",
             variable=self.popout_log_var,
             command=self._on_popout_log_change,
             corner_radius=5, checkbox_width=18, checkbox_height=18,
-            font=("Microsoft JhengHei", 12),
+            font=(FONT_UI, 12),
         ).pack(side="left", padx=(0, 12))
         ctk.CTkCheckBox(
             popout_row, text="技能傷害排行",
             variable=self.popout_skill_var,
             command=self._on_popout_skill_change,
             corner_radius=5, checkbox_width=18, checkbox_height=18,
-            font=("Microsoft JhengHei", 12),
+            font=(FONT_UI, 12),
         ).pack(side="left", padx=(0, 8))
         ctk.CTkLabel(section,
                      text="※ 勾選後日誌會以獨立視窗開啟;直接關閉獨立視窗會自動收回主視窗",
-                     font=("Microsoft JhengHei", 10),
+                     font=(FONT_UI, 10),
                      text_color="#888888", anchor="w").pack(fill="x", pady=(4, 0))
 
         # ── 「追蹤」區塊 ──
         track_section = ctk.CTkFrame(body, fg_color="transparent")
         track_section.pack(fill="x", padx=12, pady=(16, 4))
         ctk.CTkLabel(track_section, text="── 追蹤 ──",
-                     font=("Microsoft JhengHei", 12, "bold"),
+                     font=(FONT_UI, 12, "bold"),
                      text_color="#ffffff", anchor="w").pack(fill="x", pady=(0, 8))
 
         ctk.CTkCheckBox(
@@ -1547,7 +1552,7 @@ class LiveDamageMonitor:
             variable=self.track_damage_var,
             command=self._on_track_damage_change,
             corner_radius=5, checkbox_width=18, checkbox_height=18,
-            font=("Microsoft JhengHei", 12),
+            font=(FONT_UI, 12),
         ).pack(anchor="w", pady=4)
 
         ctk.CTkCheckBox(
@@ -1556,30 +1561,30 @@ class LiveDamageMonitor:
             variable=self.track_heal_var,
             command=self._on_track_heal_change,
             corner_radius=5, checkbox_width=18, checkbox_height=18,
-            font=("Microsoft JhengHei", 12),
+            font=(FONT_UI, 12),
         ).pack(anchor="w", pady=4)
 
         ctk.CTkLabel(track_section,
                      text="※ 兩者可同時勾選;至少留一個開啟以免主畫面空白",
-                     font=("Microsoft JhengHei", 10),
+                     font=(FONT_UI, 10),
                      text_color="#888888", anchor="w").pack(fill="x", pady=(8, 0))
 
         # ── 「診斷」區塊 ──
         diag_section = ctk.CTkFrame(body, fg_color="transparent")
         diag_section.pack(fill="x", padx=12, pady=(16, 4))
         ctk.CTkLabel(diag_section, text="── 診斷 ──",
-                     font=("Microsoft JhengHei", 12, "bold"),
+                     font=(FONT_UI, 12, "bold"),
                      text_color="#ffffff", anchor="w").pack(fill="x", pady=(0, 8))
 
         diag_row = ctk.CTkFrame(diag_section, fg_color="transparent")
         diag_row.pack(fill="x", pady=4)
         ctk.CTkLabel(diag_row, text="網路環境:", width=90,
-                     font=("Microsoft JhengHei", 12),
+                     font=(FONT_UI, 12),
                      anchor="w").pack(side="left", padx=(0, 8))
         ctk.CTkButton(diag_row, text="🌐 網路檢測",
                       width=120, corner_radius=6,
                       fg_color="#3a6a9a", hover_color="#4a7ab0",
-                      font=("Microsoft JhengHei", 11),
+                      font=(FONT_UI, 11),
                       command=self.show_network_check).pack(side="left", padx=(0, 8))
 
     def hide_settings(self):
@@ -1768,7 +1773,7 @@ class LiveDamageMonitor:
 
         # 詳細統計:字體與技能列 name 相同 (12pt bold),展開時才 pack
         detail_lbl = ctk.CTkLabel(container, text="", anchor="w",
-                                   font=("Microsoft JhengHei", 12, "bold"),
+                                   font=(FONT_UI, 12, "bold"),
                                    text_color="#88ccff")
 
         row = {
