@@ -66,6 +66,7 @@ VERSION_STR = "Beta V0.43"
 COVERAGE_MIN_HITS = 10  # 覆蓋率計算所需最少樣本數
 SKILL_CFG_NAME = "skills.ini"
 SETTINGS_CFG_NAME = "settings.ini"
+BPF_HELPER_NAME = "macos-bpf-access.sh"  # macOS 抓包權限設定腳本
 FONT_SCALE_MIN = 1.0
 FONT_SCALE_MAX = 2.0
 FONT_SCALE_DEFAULT = 1.0
@@ -807,8 +808,10 @@ class LiveDamageMonitor:
         self._apply_tracking_mode()
 
         # 開啟後自動在背景掃描一次收包網卡,結果會設到 self.chosen_iface
-        # 500ms 延遲讓主視窗先完全渲染出來
-        self.root.after(500, self._auto_detect_iface_on_startup)
+        # 500ms 延遲讓主視窗先完全渲染出來。
+        # macOS 會先確認有沒有 BPF 權限 — 沒有的話掃描每張網卡都只會失敗,
+        # 不如先把權限問題解決掉再掃。
+        self.root.after(500, self._start_capture_access_flow)
 
     # ================================================
     # 事件處理
@@ -1314,6 +1317,160 @@ class LiveDamageMonitor:
             self.chosen_iface = None
             return
         self.chosen_iface = iface_dict.get("name")
+
+    # ================================================
+    # macOS: BPF 權限引導
+    #   /dev/bpf* 預設是 root:wheel 0600,不提權就抓不到封包。
+    #   .app 又沒有「以管理員身分執行」這種選項,所以第一次啟動時直接在
+    #   程式裡引導使用者做一次性設定,之後就不必再輸入密碼。
+    # ================================================
+    def _start_capture_access_flow(self):
+        """啟動流程第一步:確認抓包權限,不足時引導設定。
+        非 macOS、或已經有權限 (含以 sudo 執行),就直接進入網卡自動偵測。
+        """
+        if not IS_MACOS:
+            self._auto_detect_iface_on_startup()
+            return
+        ok, _ = check_capture_permission()
+        if ok:
+            self._auto_detect_iface_on_startup()
+            return
+        self._show_bpf_access_dialog()
+
+    def _bpf_helper_script_path(self):
+        """找出 macos-bpf-access.sh:打包版在 bundle 內,原始碼版在專案根目錄。"""
+        path = get_resource_path(BPF_HELPER_NAME)
+        if os.path.exists(path):
+            return path
+        alt = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), BPF_HELPER_NAME)
+        return alt if os.path.exists(alt) else None
+
+    def _show_bpf_access_dialog(self):
+        """說明清楚要改什麼、有什麼代價,再讓使用者決定。"""
+        win = ctk.CTkToplevel(self.root)
+        win.title("需要封包擷取權限")
+        win.geometry("500x430")
+        win.resizable(False, False)
+        win.transient(self.root)
+        # macOS 的 CTkToplevel 要延遲一下才吃得到 lift/grab,否則會躲到主視窗後面
+        win.after(150, lambda: (win.lift(), win.focus_force(), win.grab_set()))
+        self._bpf_dialog = win
+
+        ctk.CTkLabel(win, text="需要封包擷取權限",
+                     font=(FONT_UI, 16, "bold")).pack(pady=(18, 6))
+
+        body = (
+            "MM Scribe 需要讀取網路封包才能統計傷害,但 macOS 預設只允許\n"
+            "管理員存取封包擷取裝置 (/dev/bpf*),因此每次都得用 sudo 從\n"
+            "終端機啟動。\n\n"
+            "可以做一次性設定,之後直接點開就能用:\n\n"
+            "  1. 建立 access_bpf 群組,並把你的帳號加入\n"
+            "  2. 安裝一個開機執行的背景項目,把擷取裝置交給該群組\n\n"
+            "這與 Wireshark 的 ChmodBPF 是同一套做法,兩者可並存。"
+        )
+        ctk.CTkLabel(win, text=body, font=(FONT_UI, 12),
+                     justify="left").pack(padx=24, anchor="w")
+
+        warn = ("⚠ 設定後,該群組的成員不需要密碼就能監聽這台電腦上的\n"
+                "   所有網路流量。不想長期開著,隨時可以還原。")
+        ctk.CTkLabel(win, text=warn, font=(FONT_UI, 11),
+                     text_color="#ff9944", justify="left").pack(padx=24, pady=(12, 0), anchor="w")
+
+        self._bpf_status_label = ctk.CTkLabel(win, text="", font=(FONT_UI, 11),
+                                              text_color="#9ad", wraplength=440, justify="left")
+        self._bpf_status_label.pack(padx=24, pady=(10, 0), anchor="w")
+
+        btn_row = ctk.CTkFrame(win, fg_color="transparent")
+        btn_row.pack(pady=16)
+
+        script = self._bpf_helper_script_path()
+        self._bpf_setup_btn = ctk.CTkButton(
+            btn_row, text="設定 (需要輸入密碼)", width=190,
+            font=(FONT_UI, 12, "bold"), command=self._run_bpf_setup)
+        self._bpf_setup_btn.pack(side="left", padx=6)
+        if script is None:
+            # 找不到腳本就別給一個按了會失敗的按鈕
+            self._bpf_setup_btn.configure(state="disabled")
+            self._bpf_status_label.configure(
+                text=f"找不到 {BPF_HELPER_NAME},請改用 sudo 啟動,或從專案目錄執行該腳本。",
+                text_color="#ff6666")
+
+        ctk.CTkButton(btn_row, text="稍後再說", width=120,
+                      font=(FONT_UI, 12), fg_color="#555", hover_color="#666",
+                      command=self._skip_bpf_setup).pack(side="left", padx=6)
+
+    def _skip_bpf_setup(self):
+        """略過設定:照樣進入偵測流程,讓日誌把失敗原因寫出來。"""
+        try:
+            self._bpf_dialog.grab_release()
+            self._bpf_dialog.destroy()
+        except Exception:
+            pass
+        self.log("=== 未設定抓包權限,請改以 sudo 啟動,否則收不到封包 ===")
+        self._auto_detect_iface_on_startup()
+
+    def _run_bpf_setup(self):
+        """以系統授權對話框提權執行設定腳本 (背景執行,不凍結 UI)。"""
+        import shlex
+        import subprocess
+
+        script = self._bpf_helper_script_path()
+        if script is None:
+            return
+
+        self._bpf_setup_btn.configure(state="disabled")
+        self._bpf_status_label.configure(
+            text="等待授權中 — 請在系統跳出的對話框輸入密碼...", text_color="#9ad")
+
+        user = os.environ.get("USER") or ""
+
+        def _worker():
+            # 腳本用 /bin/bash 呼叫,不依賴檔案的執行權限 —
+            # PyInstaller 打包的 data file 不保證會保留 +x
+            inner = f"/bin/bash {shlex.quote(script)} install --yes"
+            if user:
+                inner += f" --user {shlex.quote(user)}"
+            # 內容要嵌進 AppleScript 的字串裡,反斜線與雙引號都得跳脫
+            esc = inner.replace("\\", "\\\\").replace('"', '\\"')
+            osa = f'do shell script "{esc}" with administrator privileges'
+            try:
+                proc = subprocess.run(["osascript", "-e", osa],
+                                      capture_output=True, text=True, timeout=180)
+                rc, err = proc.returncode, (proc.stderr or "").strip()
+            except Exception as e:
+                rc, err = -1, str(e)
+            self.root.after(0, lambda: self._on_bpf_setup_done(rc, err))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_bpf_setup_done(self, rc, err):
+        if rc != 0:
+            # osascript 在使用者按取消時回報 -128
+            cancelled = "-128" in err or "User canceled" in err
+            self._bpf_status_label.configure(
+                text="已取消授權。" if cancelled else f"設定失敗:{err[:150]}",
+                text_color="#ff9944" if cancelled else "#ff6666")
+            self._bpf_setup_btn.configure(state="normal")
+            return
+
+        ok, detail = check_capture_permission()
+        if ok:
+            try:
+                self._bpf_dialog.grab_release()
+                self._bpf_dialog.destroy()
+            except Exception:
+                pass
+            self.log("=== 抓包權限設定完成,之後啟動不需要再輸入密碼 ===")
+            self._auto_detect_iface_on_startup()
+            return
+
+        # 群組成員資格要新的 process 才會生效,這種情況重開程式即可
+        self._bpf_status_label.configure(
+            text="設定已完成,但這個程式的執行階段還沒取得新的群組身分。\n"
+                 "請關閉並重新開啟 MM Scribe。",
+            text_color="#ff9944")
+        self._bpf_setup_btn.configure(state="disabled")
 
     def _auto_detect_iface_on_startup(self):
         """程式開啟時的自動偵測 (背景執行,不阻擋 UI)。

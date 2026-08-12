@@ -65,6 +65,13 @@ CONFIGS=()
 for cfg in skills.ini settings.ini; do
     [[ -f "$cfg" ]] && CONFIGS+=("--add-data=$cfg:.")
 done
+
+# BPF 權限設定腳本(在專案根目錄):首次啟動偵測到沒權限時,程式會透過系統
+# 授權對話框提權執行它,所以必須跟著打包進 bundle。
+if [[ -f ../macos-bpf-access.sh ]]; then
+    CONFIGS+=("--add-data=../macos-bpf-access.sh:.")
+fi
+
 echo "Bundled configs  : ${CONFIGS[*]:-none}"
 echo
 

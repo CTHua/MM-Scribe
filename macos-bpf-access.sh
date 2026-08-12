@@ -28,8 +28,18 @@ HELPER="${HELPER_DIR}/ChmodBPF"
 GROUP="access_bpf"
 WIRESHARK_PLIST="/Library/LaunchDaemons/org.wireshark.ChmodBPF.plist"
 
-# sudo 之下 $USER 會變成 root,要拿的是原本的使用者
-TARGET_USER="${SUDO_USER:-$USER}"
+# 要拿的是「真正在用這台電腦的人」,不是提權後的 root:
+#   - 透過 sudo 執行     → SUDO_USER
+#   - 從 GUI 提權執行     → SUDO_USER 不存在,改看 /dev/console 的擁有者,
+#                          也就是當前登入圖形介面的使用者
+#   - --user 可明確指定,優先於上面兩者
+TARGET_USER="${SUDO_USER:-$(stat -f %Su /dev/console 2>/dev/null || echo "$USER")}"
+for ((_i = 1; _i <= $#; _i++)); do
+    if [[ "${!_i}" == "--user" ]]; then
+        _j=$((_i + 1))
+        [[ -n "${!_j:-}" ]] && TARGET_USER="${!_j}"
+    fi
+done
 
 need_root() {
     if [[ "$(id -u)" -ne 0 ]]; then
@@ -97,20 +107,29 @@ cmd_status() {
 cmd_install() {
     need_root "$@"
 
+    # --yes:跳過互動確認。給程式內部呼叫用 — 那時同意已經在 GUI 上取得過了,
+    # 不該在看不到的 shell 裡再問一次(使用者根本看不到那個提示)。
+    local assume_yes=0
+    for arg in "$@"; do
+        [[ "$arg" == "--yes" || "$arg" == "-y" ]] && assume_yes=1
+    done
+
     if [[ -f "$WIRESHARK_PLIST" ]]; then
         echo "偵測到 Wireshark 的 ChmodBPF 已安裝,功能相同,不需要重複安裝。"
         echo "若仍要安裝本腳本的版本,請先移除 Wireshark 的版本。"
         exit 0
     fi
 
-    echo "即將進行以下變更:"
-    echo "  1. 建立群組 $GROUP(若不存在),並將 $TARGET_USER 加入"
-    echo "  2. 安裝 $HELPER"
-    echo "  3. 安裝並啟用 LaunchDaemon $PLIST"
-    echo
-    echo "完成後 $GROUP 的成員不需密碼即可監聽本機所有網路流量。"
-    read -r -p "確定要繼續嗎? [y/N] " reply
-    [[ "$reply" =~ ^[Yy]$ ]] || { echo "已取消。"; exit 0; }
+    if [[ $assume_yes -eq 0 ]]; then
+        echo "即將進行以下變更:"
+        echo "  1. 建立群組 $GROUP(若不存在),並將 $TARGET_USER 加入"
+        echo "  2. 安裝 $HELPER"
+        echo "  3. 安裝並啟用 LaunchDaemon $PLIST"
+        echo
+        echo "完成後 $GROUP 的成員不需密碼即可監聽本機所有網路流量。"
+        read -r -p "確定要繼續嗎? [y/N] " reply
+        [[ "$reply" =~ ^[Yy]$ ]] || { echo "已取消。"; exit 0; }
+    fi
 
     if ! dscl . -read "/Groups/$GROUP" >/dev/null 2>&1; then
         echo "建立群組 $GROUP..."
