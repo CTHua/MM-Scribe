@@ -38,16 +38,44 @@
 
 ## 系統需求
 
+### Windows
+
 - Windows 10 / 11
 - [Npcap](https://npcap.com/) 驅動
 - 系統管理員權限（scapy 抓包需要）
 - 原始碼版另需 Python 3.x 與相依套件：`customtkinter`、`scapy`
+
+### macOS
+
+- macOS 13 以上（Apple Silicon / Intel）
+- libpcap 為系統內建，**不需要**安裝 Npcap 之類的驅動
+- 抓包需要 BPF 裝置權限，二選一：
+  - 安裝 [Wireshark](https://www.wireshark.org/) 內附的 **ChmodBPF**（一次設定，之後免 sudo）
+  - 或以 `sudo` 執行
+- Python 3.12 與相依套件：`customtkinter`、`scapy`
+
+遊戲在 macOS 上是透過 App Store 安裝的 **iOS App on Mac**，
+封包直接走實體網卡，不需要模擬器、網路共享或任何轉送設定。
+封包格式與 Windows 端相同，解析邏輯共用。
+
+#### 快速開始
+
+```bash
+uv venv --python 3.12 .venv
+uv pip install --python .venv/bin/python scapy==2.7.0 customtkinter==5.2.2
+./run-macos.sh
+```
+
+`run-macos.sh` 會自動判斷是否需要提權，並處理 uv 版 Python 的 Tcl/Tk 路徑問題。
 
 ---
 
 ## 設定檔說明
 
 設定檔須放在 `MM Scribe.exe` 同一資料夾（或原始碼版的 [Score/](Score/) 資料夾內），修改後重啟程式生效。
+
+macOS 打包成 `.app` 之後，設定檔改放在 `~/Library/Application Support/MM Scribe/`
+（`.app` 內部不可寫，首次啟動會自動把預設檔複製過去）；直接跑原始碼時仍然是讀 [Score/](Score/)。
 
 ### [skills.ini](Score/skills.ini) — 技能 ID 對照與合併群組
 
@@ -82,6 +110,8 @@ popout_skill = false           ; 技能傷害排行獨立視窗
 
 ## 打包方式
 
+### Windows
+
 **開發版**（顯示開發者選項）：
 
 ```bash
@@ -94,6 +124,19 @@ python -m PyInstaller --onefile --noconsole --collect-data customtkinter Mabinog
 type nul > RELEASE.marker
 python -m PyInstaller --onefile --noconsole --collect-data customtkinter --add-data "RELEASE.marker;." MabinogiMobileScribe_Beta_V0.43.py
 ```
+
+### macOS
+
+`--add-data` 的分隔符是 `:` 而非 `;`，且要用 `--windowed` 產生 `.app`：
+
+```bash
+touch RELEASE.marker
+python -m PyInstaller --windowed --collect-data customtkinter --add-data "RELEASE.marker:." MabinogiMobileScribe_Beta_V0.43.py
+```
+
+未經簽章與公證的 `.app` 會被 Gatekeeper 攔下，首次開啟需右鍵 →「打開」。
+另外 `.app` 沒有「以系統管理員身分執行」這種選項，所以發布版建議搭配 ChmodBPF，
+否則使用者只能從終端機以 `sudo` 啟動。
 
 程式啟動時會偵測 EXE 內是否包含 `RELEASE.marker` 檔案，存在則隱藏開發者選項按鈕（釋出給他人使用）。
 

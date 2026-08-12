@@ -1,17 +1,24 @@
 """
 瑪奇即時傷害監控 - customtkinter 版
 需求: pip install customtkinter scapy
-執行時建議以系統管理員身分執行,scapy sniff 才有權限。
+抓封包需要提權:Windows 以系統管理員執行;macOS 需 root 或已放寬 /dev/bpf* 權限。
 
-打包 EXE 說明:
-  開發版 (顯示開發者選項):
+支援 Windows 10/11 與 macOS (Apple Silicon / Intel)。
+macOS 上遊戲為 iOS App on Mac,流量直接走實體網卡,抓法與 Windows 端相同。
+
+打包說明:
+  Windows 開發版 (顯示開發者選項):
     python -m PyInstaller --onefile --noconsole --collect-data customtkinter MabinogiMobileScribe_Beta_V0.43.py
 
-  發布版 (隱藏開發者選項):
+  Windows 發布版 (隱藏開發者選項):
     type nul > RELEASE.marker
     python -m PyInstaller --onefile --noconsole --collect-data customtkinter --add-data "RELEASE.marker;." MabinogiMobileScribe_Beta_V0.43.py
 
-  程式啟動時會偵測 EXE 內是否包含 RELEASE.marker 檔案,
+  macOS (--add-data 分隔符是 ':' 不是 ';'):
+    touch RELEASE.marker
+    python -m PyInstaller --windowed --collect-data customtkinter --add-data "RELEASE.marker:." MabinogiMobileScribe_Beta_V0.43.py
+
+  程式啟動時會偵測執行檔內是否包含 RELEASE.marker 檔案,
   存在則隱藏開發者選項按鈕(釋出給他人使用)。
 """
 import configparser
@@ -25,10 +32,19 @@ import webbrowser
 import customtkinter as ctk
 from scapy.all import sniff, TCP, IP
 
-# 字體:UI 文字用中文字型,數值欄位用等寬字型
-# (傷害欄靠等寬字才能對齊 Text widget 的固定 tab stop)
-FONT_UI = "Microsoft JhengHei"
-FONT_MONO = "Consolas"
+# ----------------------------------------------------
+# 平台差異
+# ----------------------------------------------------
+IS_WINDOWS = sys.platform == "win32"
+IS_MACOS = sys.platform == "darwin"
+
+# 字體:兩邊都需要「中文 UI 字體 + 等寬數字字體」,等寬是傷害欄位對齊的前提
+if IS_MACOS:
+    FONT_UI = "PingFang TC"
+    FONT_MONO = "Menlo"
+else:
+    FONT_UI = "Microsoft JhengHei"
+    FONT_MONO = "Consolas"
 
 
 def is_release_build():
@@ -65,15 +81,45 @@ LOG_TAB_STOPS = ("130", "240")
 RELEASE_BUILD = is_release_build()
 
 
+def get_resource_path(filename):
+    """取得資源檔的實際路徑。
+    - 打包成執行檔後: 資料位於 PyInstaller 解壓的臨時目錄 sys._MEIPASS
+    - 未打包 (直接跑 .py): 使用腳本所在資料夾
+    定義必須排在 get_external_path 之前 — 後者在 macOS 打包版會呼叫它,
+    而 load_skill_config() 是在模組層級就執行的。
+    """
+    if getattr(sys, "frozen", False):
+        base = getattr(sys, "_MEIPASS", "")
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, filename)
+
+
 def get_external_path(filename):
     """取得 EXE 旁邊(或原始碼所在資料夾)的外部檔路徑。
     與 get_resource_path 不同,這是使用者可編輯的檔案位置,不是 PyInstaller bundled 資源。
     """
-    if getattr(sys, "frozen", False):
-        base = os.path.dirname(sys.executable)
-    else:
-        base = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(base, filename)
+    if not getattr(sys, "frozen", False):
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+
+    if IS_MACOS:
+        # .app 內的 Contents/MacOS 使用者根本不會去翻,而且 /Applications 通常
+        # 也不可寫,所以改放 Application Support,並在首次執行時把 bundle 內的
+        # 預設檔複製過去當種子。
+        base = os.path.expanduser("~/Library/Application Support/MM Scribe")
+        target = os.path.join(base, filename)
+        if not os.path.exists(target):
+            seed = get_resource_path(filename)
+            if os.path.exists(seed):
+                try:
+                    import shutil
+                    os.makedirs(base, exist_ok=True)
+                    shutil.copy(seed, target)
+                except OSError:
+                    return seed  # 複製不過去就退回唯讀的 bundle 版本,至少能跑
+        return target
+
+    return os.path.join(os.path.dirname(sys.executable), filename)
 
 
 def load_skill_config():
@@ -245,30 +291,124 @@ def format_skill_name(skill_id):
     return SKILL_NAMES.get(skill_id) or f"0x{skill_id:08X}"
 
 
-def get_resource_path(filename):
-    """取得資源檔的實際路徑。
-    - 打包成 EXE 後: 資料位於 PyInstaller 解壓的臨時目錄 sys._MEIPASS
-    - 未打包 (直接跑 .py): 使用腳本所在資料夾
+def check_capture_backend():
+    """檢查抓封包所需的底層驅動是否就緒。
+    - Windows: 需安裝 Npcap / WinPcap,檢查關鍵 DLL 是否存在
+    - macOS:   libpcap 為系統內建,改為檢查是否有 BPF 裝置節點
+    回傳 (ok: bool, hint: str) — hint 為失敗時要顯示給使用者的補救說明。
     """
-    if getattr(sys, "frozen", False):
-        base = getattr(sys, "_MEIPASS", "")
-    else:
-        base = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(base, filename)
+    if IS_WINDOWS:
+        candidates = [
+            r"C:\Windows\System32\Npcap\wpcap.dll",       # Npcap 標準安裝路徑
+            r"C:\Windows\System32\Npcap\Packet.dll",
+            r"C:\Windows\SysWOW64\Npcap\wpcap.dll",       # 32-bit 相容位置
+            r"C:\Windows\System32\wpcap.dll",             # 舊 WinPcap 或 Npcap 相容模式
+            r"C:\Windows\SysWOW64\wpcap.dll",
+        ]
+        if any(os.path.exists(p) for p in candidates):
+            return True, ""
+        return False, "請至 https://npcap.com/ 下載並安裝"
+
+    if IS_MACOS:
+        # libpcap 自 macOS 11 起收進 dyld shared cache,檔案系統上看不到,
+        # 因此不驗證 dylib,只確認 BPF 裝置節點存在 (權限另由 check_capture_permission 判斷)
+        if any(os.path.exists(f"/dev/bpf{i}") for i in range(4)):
+            return True, ""
+        return False, "系統找不到 /dev/bpf* 裝置節點"
+
+    return False, f"尚未支援的作業系統: {sys.platform}"
 
 
-def check_npcap_installed():
-    """檢查系統是否安裝 Npcap / WinPcap。
-    透過檢查關鍵 DLL 檔案是否存在於系統目錄。
+def check_capture_permission():
+    """檢查目前是否具備開啟抓包裝置的權限。
+    - Windows: 是否以系統管理員身分執行
+    - macOS:   /dev/bpf* 多半是 root:wheel 0600,但裝了 Wireshark 的 ChmodBPF 後
+               一般使用者也能讀,所以直接測「能不能真的開起來」而非只看 euid
+    回傳 (ok: bool, detail: str)
     """
-    candidates = [
-        r"C:\Windows\System32\Npcap\wpcap.dll",       # Npcap 標準安裝路徑
-        r"C:\Windows\System32\Npcap\Packet.dll",
-        r"C:\Windows\SysWOW64\Npcap\wpcap.dll",       # 32-bit 相容位置
-        r"C:\Windows\System32\wpcap.dll",             # 舊 WinPcap 或 Npcap 相容模式
-        r"C:\Windows\SysWOW64\wpcap.dll",
-    ]
-    return any(os.path.exists(p) for p in candidates)
+    if IS_WINDOWS:
+        try:
+            import ctypes
+            if ctypes.windll.shell32.IsUserAnAdmin() != 0:
+                return True, "scapy sniff 具備所需權限"
+        except Exception:
+            pass
+        return False, "請關閉程式後對 exe 右鍵 →「以系統管理員身分執行」"
+
+    if IS_MACOS:
+        if os.geteuid() == 0:
+            return True, "以 root 執行,具備 BPF 存取權限"
+        for i in range(4):
+            path = f"/dev/bpf{i}"
+            if not os.path.exists(path):
+                continue
+            try:
+                os.close(os.open(path, os.O_RDONLY))
+                return True, "BPF 裝置可直接存取 (已套用 ChmodBPF)"
+            except PermissionError:
+                break
+            except OSError:
+                # 裝置存在但正被其他程式佔用 → 權限本身沒問題,換下一個試
+                continue
+        return False, ("BPF 裝置需要提權。建議安裝 Wireshark 內附的 ChmodBPF "
+                       "(安裝後免 sudo),或改以 sudo 執行本程式")
+
+    return False, f"尚未支援的作業系統: {sys.platform}"
+
+
+def list_network_ifaces():
+    """列舉可供 sniff 的網路介面,回傳統一格式的 dict 清單:
+        {"name": 傳給 sniff(iface=) 的識別, "description": 顯示名稱, "ips": [IPv4...]}
+
+    Windows 的 get_windows_if_list() 本來就是這個格式;macOS/Linux 走 scapy 的
+    跨平台介面表,name 會是 BSD 名稱 (en0/en1/bridge100...)。
+    """
+    if IS_WINDOWS:
+        from scapy.arch.windows import get_windows_if_list
+        return list(get_windows_if_list())
+
+    try:
+        from scapy.interfaces import get_working_ifaces
+        ifaces = get_working_ifaces()
+    except ImportError:
+        from scapy.config import conf
+        ifaces = list(conf.ifaces.values())
+
+    out = []
+    for itf in ifaces:
+        ip = getattr(itf, "ip", None)
+        name = getattr(itf, "name", None) or str(itf)
+        out.append({
+            "name": name,
+            "description": getattr(itf, "description", None) or name,
+            "ips": [ip] if ip else [],
+        })
+    return out
+
+
+def default_route_iface():
+    """回傳預設路由所在的介面名稱,失敗則 None。
+    掃描時把它排在最前面 — 遊戲流量幾乎都走這張。
+    """
+    try:
+        from scapy.config import conf
+        return conf.route.route("0.0.0.0")[0]
+    except Exception:
+        return None
+
+
+# macOS 上這些介面依其用途就不可能承載遊戲流量,先剔除可省下大量掃描時間
+# (一台開著虛擬機的 Mac 上,feth/bridge 之類的介面動輒十幾張)
+_SKIP_IFACE_PREFIXES = ("lo", "feth", "gif", "stf", "awdl", "llw", "anpi", "ap")
+
+
+def _is_never_game_traffic(name):
+    """en/bridge/utun/vmenet 一律保留 — 實體網卡、虛擬機橋接、VPN 都可能是遊戲的出口。"""
+    if not IS_MACOS or not name:
+        return False
+    return str(name).startswith(_SKIP_IFACE_PREFIXES)
+
+
 IP_FILTER_NET = "43.0.0.0/8"
 HIGHLIGHT_OPTIONS = ["無", "爆擊", "強擊", "破防", "無防備", "連擊", "多重打擊"]
 
@@ -301,16 +441,26 @@ class LiveDamageMonitor:
         initial_h = max(340, initial_h)
         self.root.geometry(f"500x{initial_h}")
 
-        # 設定視窗標題列 icon (優先用 dev icon,找不到再退回 icon.ico)
-        preferred = "icon_dev.ico" if not RELEASE_BUILD else "icon.ico"
-        for candidate in (preferred, "icon.ico"):
+        # 設定視窗標題列 icon (優先用 dev icon,找不到再退回一般 icon)
+        # macOS 的 Tk 不吃 .ico,改用 iconphoto 讀 PNG;打包成 .app 後
+        # Dock 圖示是由 bundle 的 CFBundleIconFile 提供,這裡失敗不影響功能。
+        if IS_MACOS:
+            candidates = ("icon_dev.png" if not RELEASE_BUILD else "icon.png", "icon.png")
+        else:
+            candidates = ("icon_dev.ico" if not RELEASE_BUILD else "icon.ico", "icon.ico")
+        for candidate in candidates:
             icon_path = get_resource_path(candidate)
-            if os.path.exists(icon_path):
-                try:
+            if not os.path.exists(icon_path):
+                continue
+            try:
+                if IS_MACOS:
+                    self._app_icon = tk.PhotoImage(file=icon_path)
+                    self.root.iconphoto(True, self._app_icon)
+                else:
                     self.root.iconbitmap(icon_path)
-                    break
-                except Exception:
-                    pass
+                break
+            except Exception:
+                pass
         # 最小尺寸:寬 400 高 180 (剛好夠塞看板+兩排控制列+日誌 header)
         self.root.minsize(400, 180)
 
@@ -1078,7 +1228,6 @@ class LiveDamageMonitor:
         """
         def _worker():
             try:
-                from scapy.arch.windows import get_windows_if_list
                 from scapy.all import sniff as _sniff
 
                 def _extract_ipv4(raw):
@@ -1095,7 +1244,7 @@ class LiveDamageMonitor:
                             and not str(ip).startswith("169.254.")]
 
                 try:
-                    raw_ifs = get_windows_if_list()
+                    raw_ifs = list_network_ifaces()
                 except Exception as e:
                     self.root.after(0, lambda err=e: on_progress(
                         "warn", f"無法列出介面: {err}"))
@@ -1103,15 +1252,20 @@ class LiveDamageMonitor:
                     return
 
                 ifs = [i for i in raw_ifs if _extract_ipv4(i.get("ips"))]
+                ifs = [i for i in ifs if not _is_never_game_traffic(i.get("name"))]
                 if not ifs:
                     self.root.after(0, lambda: on_progress(
                         "warn", "沒有可掃描的介面 (無介面有有效 IPv4)"))
                     self.root.after(0, lambda: on_done(None, []))
                     return
 
+                # 預設路由那張排最前面:絕大多數情況遊戲就走這張,先掃到就能提早收工
+                preferred = default_route_iface()
+                ifs.sort(key=lambda i: i.get("name") != preferred)
+
                 total_time = len(ifs) * per_iface_timeout
                 self.root.after(0, lambda: on_progress(
-                    "info", f"開始掃描 {len(ifs)} 張介面,每張測 {per_iface_timeout} 秒 (總計約 {total_time} 秒)"))
+                    "info", f"開始掃描 {len(ifs)} 張介面,每張測 {per_iface_timeout} 秒 (最多約 {total_time} 秒)"))
 
                 hits = []
                 for iface in ifs:
@@ -1131,6 +1285,10 @@ class LiveDamageMonitor:
                         hits.append((iface, count, name))
                         self.root.after(0, lambda n=name, c=count: on_progress(
                             "ok", f"✓ {n}", f"收到 {c} 個目標封包"))
+                        # 預設路由那張已經收到流量就不必再試其他張,省下數十秒
+                        # (macOS 上虛擬介面動輒十幾張,全掃完使用者早就等到不耐煩)
+                        if iface_key == preferred:
+                            break
                     else:
                         self.root.after(0, lambda n=name: on_progress(
                             "info", f"  {n}", "沒收到"))
@@ -1221,8 +1379,6 @@ class LiveDamageMonitor:
 
     def _run_network_checks(self):
         """執行所有網路環境檢測項目並輸出結果。"""
-        import ctypes
-
         area = self._netcheck_result
         area.configure(state="normal")
         area.delete("1.0", "end")
@@ -1237,27 +1393,25 @@ class LiveDamageMonitor:
         def section(title):
             area._textbox.insert("end", f"── {title} ──\n\n", "tag_header")
 
-        # === 1. 管理員權限 ===
+        # === 1. 抓包權限 ===
         section("1. 執行權限")
-        is_admin = False
-        try:
-            is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
-        except Exception:
-            pass
-        if is_admin:
-            write("ok", "以系統管理員身分執行", "scapy sniff 具備所需權限")
+        perm_ok, perm_detail = check_capture_permission()
+        if perm_ok:
+            write("ok", "已具備抓包權限", perm_detail)
         else:
-            write("fail", "非系統管理員權限",
+            write("fail", "權限不足",
                   "★ 這是抓不到封包最常見的原因 ★",
-                  "請關閉程式後對 exe 右鍵 → 「以系統管理員身分執行」")
+                  perm_detail)
 
-        # === 2. Npcap ===
-        section("2. Npcap 驅動")
-        if check_npcap_installed():
-            write("ok", "Npcap 驅動已安裝")
+        # === 2. 抓包驅動 ===
+        driver_name = "Npcap 驅動" if IS_WINDOWS else "libpcap / BPF"
+        section(f"2. {driver_name}")
+        backend_ok, backend_hint = check_capture_backend()
+        if backend_ok:
+            write("ok", f"{driver_name} 已就緒",
+                  *([] if IS_WINDOWS else ["libpcap 為 macOS 內建,無須另外安裝"]))
         else:
-            write("fail", "未偵測到 Npcap 驅動",
-                  "請至 https://npcap.com/ 下載並安裝")
+            write("fail", f"未偵測到 {driver_name}", backend_hint)
 
         # ── 共用工具 ──
         def extract_ipv4_list(raw):
@@ -1313,8 +1467,7 @@ class LiveDamageMonitor:
         # === 3. 網路介面 ===
         section("3. 網路介面偵測 (已過濾無 IPv4 的介面)")
         try:
-            from scapy.arch.windows import get_windows_if_list
-            ifs = get_windows_if_list()
+            ifs = list_network_ifaces()
             if not ifs:
                 write("warn", "沒有找到任何網路介面")
             else:
@@ -1328,11 +1481,15 @@ class LiveDamageMonitor:
                     ipv4 = extract_ipv4_list(i.get("ips"))
                     ip_str = ", ".join(ipv4) if ipv4 else "(無 IPv4)"
 
-                    lower_desc = desc.lower()
+                    # macOS 的 description 就是 BSD 名稱,所以連 name 一起比對:
+                    # utun=VPN, bridge/vmenet=虛擬機橋接, awdl/llw=AirDrop, feth/gif/stf=虛擬
+                    lower_desc = (desc + " " + name).lower()
                     tag = ""
                     if any(kw in lower_desc for kw in
                            ["virtual", "vmware", "vbox", "hyper-v", "tap", "tun",
-                            "wireguard", "wsl", "loopback"]):
+                            "wireguard", "wsl", "loopback",
+                            "utun", "bridge", "vmenet", "awdl", "llw", "feth",
+                            "gif", "stf", "anpi", "lo0"]):
                         tag = " ⚠虛擬/VPN"
 
                     if is_active_iface(i):
@@ -1348,14 +1505,13 @@ class LiveDamageMonitor:
         # === 4. scapy 目前綁定的介面 ===
         section("4. scapy 目前綁定介面")
         try:
-            from scapy.arch.windows import get_windows_if_list
             friendly = active_name
             desc = ""
             ipv4 = extract_ipv4_list(getattr(active_iface, "ips", None)) if active_iface_str else []
 
             # 沒抓到就從介面清單反查
             if active_iface_str and (not friendly or not ipv4):
-                for iface in get_windows_if_list():
+                for iface in list_network_ifaces():
                     if is_active_iface(iface):
                         if not friendly:
                             friendly = str(iface.get("description") or iface.get("name") or "")
@@ -1719,11 +1875,17 @@ class LiveDamageMonitor:
 
     def _on_skill_wheel_all(self, event):
         """統一的 wheel handler,直接操作 skill_scroll 內部的 canvas。
-        除數用 /40 與 CTk 內建速度換算一致,再乘以 SCROLL_SPEED 加倍 (預設 3x)。
+
+        平台差異:Windows 的 event.delta 是 ±120 的倍數,除以 40 換算成捲動格數
+        (與 CTk 內建速度一致);macOS Tk 送出的 delta 已經是格數本身 (±1~3),
+        再除 40 會被整數截斷成 0,滾輪等同失效,所以直接使用原值。
         """
         SCROLL_SPEED = 3
         try:
-            step = int(-event.delta / 40) * SCROLL_SPEED
+            if IS_MACOS:
+                step = int(-event.delta) * SCROLL_SPEED
+            else:
+                step = int(-event.delta / 40) * SCROLL_SPEED
             self.skill_scroll._parent_canvas.yview_scroll(step, "units")
         except Exception:
             pass
