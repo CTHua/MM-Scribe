@@ -1,17 +1,24 @@
 """
 瑪奇即時傷害監控 - customtkinter 版
 需求: pip install customtkinter scapy
-執行時建議以系統管理員身分執行,scapy sniff 才有權限。
+抓封包需要提權:Windows 以系統管理員執行;macOS 需 root 或已放寬 /dev/bpf* 權限。
 
-打包 EXE 說明:
-  開發版 (顯示開發者選項):
+支援 Windows 10/11 與 macOS (Apple Silicon / Intel)。
+macOS 上遊戲為 iOS App on Mac,流量直接走實體網卡,抓法與 Windows 端相同。
+
+打包說明:
+  Windows 開發版 (顯示開發者選項):
     python -m PyInstaller --onefile --noconsole --collect-data customtkinter MabinogiMobileScribe_Beta_V0.43.py
 
-  發布版 (隱藏開發者選項):
+  Windows 發布版 (隱藏開發者選項):
     type nul > RELEASE.marker
     python -m PyInstaller --onefile --noconsole --collect-data customtkinter --add-data "RELEASE.marker;." MabinogiMobileScribe_Beta_V0.43.py
 
-  程式啟動時會偵測 EXE 內是否包含 RELEASE.marker 檔案,
+  macOS (--add-data 分隔符是 ':' 不是 ';'):
+    touch RELEASE.marker
+    python -m PyInstaller --windowed --collect-data customtkinter --add-data "RELEASE.marker:." MabinogiMobileScribe_Beta_V0.43.py
+
+  程式啟動時會偵測執行檔內是否包含 RELEASE.marker 檔案,
   存在則隱藏開發者選項按鈕(釋出給他人使用)。
 """
 import configparser
@@ -24,6 +31,20 @@ import tkinter as tk  # 只用 StringVar / BooleanVar
 import webbrowser
 import customtkinter as ctk
 from scapy.all import sniff, TCP, IP
+
+# ----------------------------------------------------
+# 平台差異
+# ----------------------------------------------------
+IS_WINDOWS = sys.platform == "win32"
+IS_MACOS = sys.platform == "darwin"
+
+# 字體:兩邊都需要「中文 UI 字體 + 等寬數字字體」,等寬是傷害欄位對齊的前提
+if IS_MACOS:
+    FONT_UI = "PingFang TC"
+    FONT_MONO = "Menlo"
+else:
+    FONT_UI = "Microsoft JhengHei"
+    FONT_MONO = "Consolas"
 
 
 def is_release_build():
@@ -45,6 +66,7 @@ VERSION_STR = "Beta V0.43"
 COVERAGE_MIN_HITS = 10  # 覆蓋率計算所需最少樣本數
 SKILL_CFG_NAME = "skills.ini"
 SETTINGS_CFG_NAME = "settings.ini"
+BPF_HELPER_NAME = "macos-bpf-access.sh"  # macOS 抓包權限設定腳本
 FONT_SCALE_MIN = 1.0
 FONT_SCALE_MAX = 2.0
 FONT_SCALE_DEFAULT = 1.0
@@ -60,15 +82,45 @@ LOG_TAB_STOPS = ("130", "240")
 RELEASE_BUILD = is_release_build()
 
 
+def get_resource_path(filename):
+    """取得資源檔的實際路徑。
+    - 打包成執行檔後: 資料位於 PyInstaller 解壓的臨時目錄 sys._MEIPASS
+    - 未打包 (直接跑 .py): 使用腳本所在資料夾
+    定義必須排在 get_external_path 之前 — 後者在 macOS 打包版會呼叫它,
+    而 load_skill_config() 是在模組層級就執行的。
+    """
+    if getattr(sys, "frozen", False):
+        base = getattr(sys, "_MEIPASS", "")
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, filename)
+
+
 def get_external_path(filename):
     """取得 EXE 旁邊(或原始碼所在資料夾)的外部檔路徑。
     與 get_resource_path 不同,這是使用者可編輯的檔案位置,不是 PyInstaller bundled 資源。
     """
-    if getattr(sys, "frozen", False):
-        base = os.path.dirname(sys.executable)
-    else:
-        base = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(base, filename)
+    if not getattr(sys, "frozen", False):
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+
+    if IS_MACOS:
+        # .app 內的 Contents/MacOS 使用者根本不會去翻,而且 /Applications 通常
+        # 也不可寫,所以改放 Application Support,並在首次執行時把 bundle 內的
+        # 預設檔複製過去當種子。
+        base = os.path.expanduser("~/Library/Application Support/MM Scribe")
+        target = os.path.join(base, filename)
+        if not os.path.exists(target):
+            seed = get_resource_path(filename)
+            if os.path.exists(seed):
+                try:
+                    import shutil
+                    os.makedirs(base, exist_ok=True)
+                    shutil.copy(seed, target)
+                except OSError:
+                    return seed  # 複製不過去就退回唯讀的 bundle 版本,至少能跑
+        return target
+
+    return os.path.join(os.path.dirname(sys.executable), filename)
 
 
 def load_skill_config():
@@ -240,30 +292,127 @@ def format_skill_name(skill_id):
     return SKILL_NAMES.get(skill_id) or f"0x{skill_id:08X}"
 
 
-def get_resource_path(filename):
-    """取得資源檔的實際路徑。
-    - 打包成 EXE 後: 資料位於 PyInstaller 解壓的臨時目錄 sys._MEIPASS
-    - 未打包 (直接跑 .py): 使用腳本所在資料夾
+def check_capture_backend():
+    """檢查抓封包所需的底層驅動是否就緒。
+    - Windows: 需安裝 Npcap / WinPcap,檢查關鍵 DLL 是否存在
+    - macOS:   libpcap 為系統內建,改為檢查是否有 BPF 裝置節點
+    回傳 (ok: bool, hint: str) — hint 為失敗時要顯示給使用者的補救說明。
     """
-    if getattr(sys, "frozen", False):
-        base = getattr(sys, "_MEIPASS", "")
-    else:
-        base = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(base, filename)
+    if IS_WINDOWS:
+        candidates = [
+            r"C:\Windows\System32\Npcap\wpcap.dll",       # Npcap 標準安裝路徑
+            r"C:\Windows\System32\Npcap\Packet.dll",
+            r"C:\Windows\SysWOW64\Npcap\wpcap.dll",       # 32-bit 相容位置
+            r"C:\Windows\System32\wpcap.dll",             # 舊 WinPcap 或 Npcap 相容模式
+            r"C:\Windows\SysWOW64\wpcap.dll",
+        ]
+        if any(os.path.exists(p) for p in candidates):
+            return True, ""
+        return False, "請至 https://npcap.com/ 下載並安裝"
+
+    if IS_MACOS:
+        # libpcap 自 macOS 11 起收進 dyld shared cache,檔案系統上看不到,
+        # 因此不驗證 dylib,只確認 BPF 裝置節點存在 (權限另由 check_capture_permission 判斷)
+        if any(os.path.exists(f"/dev/bpf{i}") for i in range(4)):
+            return True, ""
+        return False, "系統找不到 /dev/bpf* 裝置節點"
+
+    return False, f"尚未支援的作業系統: {sys.platform}"
 
 
-def check_npcap_installed():
-    """檢查系統是否安裝 Npcap / WinPcap。
-    透過檢查關鍵 DLL 檔案是否存在於系統目錄。
+def check_capture_permission():
+    """檢查目前是否具備開啟抓包裝置的權限。
+    - Windows: 是否以系統管理員身分執行
+    - macOS:   /dev/bpf* 多半是 root:wheel 0600,但裝了 Wireshark 的 ChmodBPF 後
+               一般使用者也能讀,所以直接測「能不能真的開起來」而非只看 euid
+    回傳 (ok: bool, detail: str)
     """
-    candidates = [
-        r"C:\Windows\System32\Npcap\wpcap.dll",       # Npcap 標準安裝路徑
-        r"C:\Windows\System32\Npcap\Packet.dll",
-        r"C:\Windows\SysWOW64\Npcap\wpcap.dll",       # 32-bit 相容位置
-        r"C:\Windows\System32\wpcap.dll",             # 舊 WinPcap 或 Npcap 相容模式
-        r"C:\Windows\SysWOW64\wpcap.dll",
-    ]
-    return any(os.path.exists(p) for p in candidates)
+    if IS_WINDOWS:
+        try:
+            import ctypes
+            if ctypes.windll.shell32.IsUserAnAdmin() != 0:
+                return True, "scapy sniff 具備所需權限"
+        except Exception:
+            pass
+        return False, "請關閉程式後對 exe 右鍵 →「以系統管理員身分執行」"
+
+    if IS_MACOS:
+        if os.geteuid() == 0:
+            return True, "以 root 執行,具備 BPF 存取權限"
+        for i in range(4):
+            path = f"/dev/bpf{i}"
+            if not os.path.exists(path):
+                continue
+            try:
+                # 必須用 O_RDWR:scapy 的 get_dev_bpf() 就是這樣開的。
+                # 只用 O_RDONLY 測的話,權限若設成唯讀會誤判為可用,
+                # 但實際 sniff 仍會失敗 — 那種狀況極難除錯。
+                os.close(os.open(path, os.O_RDWR))
+                return True, "BPF 裝置可直接存取 (已套用 ChmodBPF)"
+            except PermissionError:
+                break
+            except OSError:
+                # 裝置存在但正被其他程式佔用 → 權限本身沒問題,換下一個試
+                continue
+        return False, ("BPF 裝置需要提權。建議安裝 Wireshark 內附的 ChmodBPF "
+                       "(安裝後免 sudo),或改以 sudo 執行本程式")
+
+    return False, f"尚未支援的作業系統: {sys.platform}"
+
+
+def list_network_ifaces():
+    """列舉可供 sniff 的網路介面,回傳統一格式的 dict 清單:
+        {"name": 傳給 sniff(iface=) 的識別, "description": 顯示名稱, "ips": [IPv4...]}
+
+    Windows 的 get_windows_if_list() 本來就是這個格式;macOS/Linux 走 scapy 的
+    跨平台介面表,name 會是 BSD 名稱 (en0/en1/bridge100...)。
+    """
+    if IS_WINDOWS:
+        from scapy.arch.windows import get_windows_if_list
+        return list(get_windows_if_list())
+
+    try:
+        from scapy.interfaces import get_working_ifaces
+        ifaces = get_working_ifaces()
+    except ImportError:
+        from scapy.config import conf
+        ifaces = list(conf.ifaces.values())
+
+    out = []
+    for itf in ifaces:
+        ip = getattr(itf, "ip", None)
+        name = getattr(itf, "name", None) or str(itf)
+        out.append({
+            "name": name,
+            "description": getattr(itf, "description", None) or name,
+            "ips": [ip] if ip else [],
+        })
+    return out
+
+
+def default_route_iface():
+    """回傳預設路由所在的介面名稱,失敗則 None。
+    掃描時把它排在最前面 — 遊戲流量幾乎都走這張。
+    """
+    try:
+        from scapy.config import conf
+        return conf.route.route("0.0.0.0")[0]
+    except Exception:
+        return None
+
+
+# macOS 上這些介面依其用途就不可能承載遊戲流量,先剔除可省下大量掃描時間
+# (一台開著虛擬機的 Mac 上,feth/bridge 之類的介面動輒十幾張)
+_SKIP_IFACE_PREFIXES = ("lo", "feth", "gif", "stf", "awdl", "llw", "anpi", "ap")
+
+
+def _is_never_game_traffic(name):
+    """en/bridge/utun/vmenet 一律保留 — 實體網卡、虛擬機橋接、VPN 都可能是遊戲的出口。"""
+    if not IS_MACOS or not name:
+        return False
+    return str(name).startswith(_SKIP_IFACE_PREFIXES)
+
+
 IP_FILTER_NET = "43.0.0.0/8"
 HIGHLIGHT_OPTIONS = ["無", "爆擊", "強擊", "破防", "無防備", "連擊", "多重打擊"]
 
@@ -296,16 +445,26 @@ class LiveDamageMonitor:
         initial_h = max(340, initial_h)
         self.root.geometry(f"500x{initial_h}")
 
-        # 設定視窗標題列 icon (優先用 dev icon,找不到再退回 icon.ico)
-        preferred = "icon_dev.ico" if not RELEASE_BUILD else "icon.ico"
-        for candidate in (preferred, "icon.ico"):
+        # 設定視窗標題列 icon (優先用 dev icon,找不到再退回一般 icon)
+        # macOS 的 Tk 不吃 .ico,改用 iconphoto 讀 PNG;打包成 .app 後
+        # Dock 圖示是由 bundle 的 CFBundleIconFile 提供,這裡失敗不影響功能。
+        if IS_MACOS:
+            candidates = ("icon_dev.png" if not RELEASE_BUILD else "icon.png", "icon.png")
+        else:
+            candidates = ("icon_dev.ico" if not RELEASE_BUILD else "icon.ico", "icon.ico")
+        for candidate in candidates:
             icon_path = get_resource_path(candidate)
-            if os.path.exists(icon_path):
-                try:
+            if not os.path.exists(icon_path):
+                continue
+            try:
+                if IS_MACOS:
+                    self._app_icon = tk.PhotoImage(file=icon_path)
+                    self.root.iconphoto(True, self._app_icon)
+                else:
                     self.root.iconbitmap(icon_path)
-                    break
-                except Exception:
-                    pass
+                break
+            except Exception:
+                pass
         # 最小尺寸:寬 400 高 180 (剛好夠塞看板+兩排控制列+日誌 header)
         self.root.minsize(400, 180)
 
@@ -338,9 +497,9 @@ class LiveDamageMonitor:
         # 同一套字體/縮放管線 (widget_scaling × DPI scaling 都會自動套用),
         # 兩邊視覺大小一致。共用同一份 font instance,scale 變更時 CTk 會自動更新。
         self._skill_name_font = ctk.CTkFont(
-            family="Microsoft JhengHei", size=12, weight="bold")
+            family=FONT_UI, size=12, weight="bold")
         self._skill_value_font = ctk.CTkFont(
-            family="Consolas", size=12, weight="bold")
+            family=FONT_MONO, size=12, weight="bold")
 
         # Resize debounce: 拖窗期間暫停技能排行更新,停下 150ms 後補一次
         self._is_resizing = False
@@ -395,20 +554,20 @@ class LiveDamageMonitor:
         left_stats = ctk.CTkFrame(main_row, corner_radius=0, fg_color="transparent")
         left_stats.pack(side="left", expand=True, fill="x", padx=10, pady=(8, 4))
         ctk.CTkLabel(left_stats, text="累積傷害",
-                     font=("Microsoft JhengHei", 12, "bold"),
+                     font=(FONT_UI, 12, "bold"),
                      text_color="#888888").pack()
         self.lbl_total_dmg = ctk.CTkLabel(left_stats, text="0",
-                                          font=("Consolas", 24, "bold"),
+                                          font=(FONT_MONO, 24, "bold"),
                                           text_color="#ff4d4d")
         self.lbl_total_dmg.pack(pady=(2, 0))
 
         right_stats = ctk.CTkFrame(main_row, corner_radius=0, fg_color="transparent")
         right_stats.pack(side="right", expand=True, fill="x", padx=10, pady=(8, 4))
         ctk.CTkLabel(right_stats, text="DPS (每秒傷害)",
-                     font=("Microsoft JhengHei", 12, "bold"),
+                     font=(FONT_UI, 12, "bold"),
                      text_color="#888888").pack()
         self.lbl_dps = ctk.CTkLabel(right_stats, text="0",
-                                    font=("Consolas", 24, "bold"),
+                                    font=(FONT_MONO, 24, "bold"),
                                     text_color="#ffcc4d")
         self.lbl_dps.pack(pady=(2, 0))
 
@@ -421,10 +580,10 @@ class LiveDamageMonitor:
             col = ctk.CTkFrame(cov_row, fg_color="transparent")
             col.pack(side="left", expand=True, fill="x", padx=4)
             ctk.CTkLabel(col, text=f"{tag_name}覆蓋率",
-                         font=("Microsoft JhengHei", 12, "bold"),
+                         font=(FONT_UI, 12, "bold"),
                          text_color="#888888").pack()
             lbl = ctk.CTkLabel(col, text="—",
-                               font=("Consolas", 16, "bold"),
+                               font=(FONT_MONO, 16, "bold"),
                                text_color="#88ccff")
             lbl.pack()
             self.lbl_cov[tag_name] = lbl
@@ -440,10 +599,10 @@ class LiveDamageMonitor:
         heal_total_col = ctk.CTkFrame(heal_total_row, fg_color="transparent")
         heal_total_col.pack(expand=True, fill="x", padx=10, pady=(8, 4))
         ctk.CTkLabel(heal_total_col, text="治癒總量",
-                     font=("Microsoft JhengHei", 12, "bold"),
+                     font=(FONT_UI, 12, "bold"),
                      text_color="#888888").pack()
         self.lbl_heal_total = ctk.CTkLabel(heal_total_col, text="0",
-                                            font=("Consolas", 24, "bold"),
+                                            font=(FONT_MONO, 24, "bold"),
                                             text_color="#4dd471")
         self.lbl_heal_total.pack(pady=(2, 0))
 
@@ -453,19 +612,19 @@ class LiveDamageMonitor:
         self_col = ctk.CTkFrame(heal_sub_row, fg_color="transparent")
         self_col.pack(side="left", expand=True, fill="x", padx=4)
         ctk.CTkLabel(self_col, text="自身治癒",
-                     font=("Microsoft JhengHei", 11, "bold"),
+                     font=(FONT_UI, 11, "bold"),
                      text_color="#888888").pack()
         self.lbl_heal_self = ctk.CTkLabel(self_col, text="0",
-                                           font=("Consolas", 16, "bold"),
+                                           font=(FONT_MONO, 16, "bold"),
                                            text_color="#4dd471")
         self.lbl_heal_self.pack()
         ally_col = ctk.CTkFrame(heal_sub_row, fg_color="transparent")
         ally_col.pack(side="left", expand=True, fill="x", padx=4)
         ctk.CTkLabel(ally_col, text="隊友治癒",
-                     font=("Microsoft JhengHei", 11, "bold"),
+                     font=(FONT_UI, 11, "bold"),
                      text_color="#888888").pack()
         self.lbl_heal_ally = ctk.CTkLabel(ally_col, text="0",
-                                           font=("Consolas", 16, "bold"),
+                                           font=(FONT_MONO, 16, "bold"),
                                            text_color="#88ccff")
         self.lbl_heal_ally.pack()
 
@@ -550,7 +709,7 @@ class LiveDamageMonitor:
         self._btn_timer_idle_hover = self.btn_timer.cget("hover_color")
 
         self.lbl_timer_remaining = ctk.CTkLabel(ctrl_row3, text="",
-                                                 font=("Consolas", 13, "bold"),
+                                                 font=(FONT_MONO, 13, "bold"),
                                                  text_color="#88ccff")
         self.lbl_timer_remaining.pack(side="left", padx=(0, 8), pady=6)
 
@@ -567,19 +726,19 @@ class LiveDamageMonitor:
         ctk.CTkButton(self.status_bar, text="💬 Discord",
                       width=90, height=22, corner_radius=6,
                       fg_color="#5865f2", hover_color="#4752c4",
-                      font=("Microsoft JhengHei", 10),
+                      font=(FONT_UI, 10),
                       command=self.open_discord).pack(side="left", padx=(8, 4), pady=2)
         ctk.CTkButton(self.status_bar, text="⚠ 免責聲明",
                       width=90, height=22, corner_radius=6,
                       fg_color="#4a4a4a", hover_color="#6a6a6a",
-                      font=("Microsoft JhengHei", 10),
+                      font=(FONT_UI, 10),
                       command=self.show_disclaimer).pack(side="left", padx=4, pady=2)
 
         # 右側:設定
         ctk.CTkButton(self.status_bar, text="⚙ 設定",
                       width=70, height=22, corner_radius=6,
                       fg_color="#4a4a4a", hover_color="#6a6a6a",
-                      font=("Microsoft JhengHei", 10),
+                      font=(FONT_UI, 10),
                       command=self.show_settings).pack(side="right", padx=(4, 8), pady=2)
 
         # ----------------------------------------------------
@@ -601,7 +760,7 @@ class LiveDamageMonitor:
         self.btn_heal_toggle = ctk.CTkButton(
             heal_header,
             text="▼ 治癒事件日誌",
-            font=("Microsoft JhengHei", 11, "bold"),
+            font=(FONT_UI, 11, "bold"),
             fg_color="transparent",
             hover_color="#2a2a2a",
             anchor="w",
@@ -612,7 +771,7 @@ class LiveDamageMonitor:
         self.btn_heal_toggle.pack(side="left", fill="x", expand=True)
 
         self.heal_log_area = ctk.CTkTextbox(self.heal_log_pane, wrap="word",
-                                             font=("Consolas", 13),
+                                             font=(FONT_MONO, 13),
                                              corner_radius=0)
         self.heal_log_area.pack(fill="both", expand=True, padx=6, pady=6)
         # 治療自己 (綠) / 治療他人 (藍) 顏色標籤
@@ -627,8 +786,8 @@ class LiveDamageMonitor:
         # ----------------------------------------------------
         self.dev_pane = ctk.CTkFrame(root, corner_radius=0)
         ctk.CTkLabel(self.dev_pane, text="🛠 開發者 Flag 診斷",
-                     font=("Microsoft JhengHei", 11, "bold")).pack(anchor="w", padx=10, pady=(6, 0))
-        self.dev_log_area = ctk.CTkTextbox(self.dev_pane, wrap="word", font=("Consolas", 12),
+                     font=(FONT_UI, 11, "bold")).pack(anchor="w", padx=10, pady=(6, 0))
+        self.dev_log_area = ctk.CTkTextbox(self.dev_pane, wrap="word", font=(FONT_MONO, 12),
                                            corner_radius=0, height=140)
         self.dev_log_area.pack(fill="both", expand=True, padx=6, pady=6)
         self.dev_log_area.configure(state="disabled")
@@ -649,8 +808,10 @@ class LiveDamageMonitor:
         self._apply_tracking_mode()
 
         # 開啟後自動在背景掃描一次收包網卡,結果會設到 self.chosen_iface
-        # 500ms 延遲讓主視窗先完全渲染出來
-        self.root.after(500, self._auto_detect_iface_on_startup)
+        # 500ms 延遲讓主視窗先完全渲染出來。
+        # macOS 會先確認有沒有 BPF 權限 — 沒有的話掃描每張網卡都只會失敗,
+        # 不如先把權限問題解決掉再掃。
+        self.root.after(500, self._start_capture_access_flow)
 
     # ================================================
     # 事件處理
@@ -690,7 +851,7 @@ class LiveDamageMonitor:
             self.log_pane,
             text=("▶ 即時攻擊事件日誌 (已折疊)" if self.log_collapsed
                   else "▼ 即時攻擊事件日誌"),
-            font=("Microsoft JhengHei", 11, "bold"),
+            font=(FONT_UI, 11, "bold"),
             fg_color="transparent",
             hover_color="#2a2a2a",
             anchor="w",
@@ -700,7 +861,7 @@ class LiveDamageMonitor:
         )
         self.btn_log_toggle.pack(fill="x", padx=6, pady=(6, 0))
         self.log_area = ctk.CTkTextbox(self.log_pane, wrap="word",
-                                        font=("Consolas", 13), corner_radius=0)
+                                        font=(FONT_MONO, 13), corner_radius=0)
         # 折疊狀態下不 pack log_area,由 toggle_log_collapse 處理
         if not self.log_collapsed:
             self.log_area.pack(fill="both", expand=True, padx=6, pady=6)
@@ -721,7 +882,7 @@ class LiveDamageMonitor:
             skill_header,
             text=("▶ 技能傷害排行 (已折疊)" if self.skill_collapsed
                   else "▼ 技能傷害排行"),
-            font=("Microsoft JhengHei", 11, "bold"),
+            font=(FONT_UI, 11, "bold"),
             fg_color="transparent",
             hover_color="#2a2a2a",
             anchor="w",
@@ -735,7 +896,7 @@ class LiveDamageMonitor:
             skill_header, text="合併同技能", variable=self.merge_var,
             command=self.update_skill_ranking,
             corner_radius=5, checkbox_width=18, checkbox_height=18,
-            font=("Microsoft JhengHei", 11),
+            font=(FONT_UI, 11),
         ).pack(side="right", padx=(6, 4))
         self.skill_scroll = ctk.CTkScrollableFrame(self.skill_pane,
                                                      corner_radius=0,
@@ -1007,11 +1168,11 @@ class LiveDamageMonitor:
         header = ctk.CTkFrame(overlay, fg_color="transparent", height=44)
         header.pack(fill="x", padx=12, pady=(12, 0))
         ctk.CTkLabel(header, text="🌐 網路環境檢測",
-                     font=("Microsoft JhengHei", 16, "bold"),
+                     font=(FONT_UI, 16, "bold"),
                      text_color="#4dccff").pack(side="left", padx=6)
         ctk.CTkButton(header, text="✕", width=32, height=32, corner_radius=16,
                       fg_color="#3a3a3a", hover_color="#c94a4a",
-                      font=("Consolas", 14, "bold"),
+                      font=(FONT_MONO, 14, "bold"),
                       command=self.hide_network_check).pack(side="right", padx=6)
         ctk.CTkButton(header, text="🔄 重新檢測", width=100, height=32,
                       corner_radius=8,
@@ -1024,7 +1185,7 @@ class LiveDamageMonitor:
 
         # 結果顯示區
         self._netcheck_result = ctk.CTkTextbox(overlay, wrap="word",
-                                                font=("Consolas", 11),
+                                                font=(FONT_MONO, 11),
                                                 corner_radius=0,
                                                 fg_color="#1a1a1a")
         self._netcheck_result.pack(fill="both", expand=True, padx=16, pady=12)
@@ -1037,7 +1198,7 @@ class LiveDamageMonitor:
         self._netcheck_result._textbox.tag_config("tag_active", foreground="#66ffa0")
         self._netcheck_result._textbox.tag_config("tag_header",
                                                    foreground="#ffffff",
-                                                   font=("Microsoft JhengHei", 12, "bold"))
+                                                   font=(FONT_UI, 12, "bold"))
 
         self._run_network_checks()
 
@@ -1073,7 +1234,6 @@ class LiveDamageMonitor:
         """
         def _worker():
             try:
-                from scapy.arch.windows import get_windows_if_list
                 from scapy.all import sniff as _sniff
 
                 def _extract_ipv4(raw):
@@ -1090,7 +1250,7 @@ class LiveDamageMonitor:
                             and not str(ip).startswith("169.254.")]
 
                 try:
-                    raw_ifs = get_windows_if_list()
+                    raw_ifs = list_network_ifaces()
                 except Exception as e:
                     self.root.after(0, lambda err=e: on_progress(
                         "warn", f"無法列出介面: {err}"))
@@ -1098,15 +1258,20 @@ class LiveDamageMonitor:
                     return
 
                 ifs = [i for i in raw_ifs if _extract_ipv4(i.get("ips"))]
+                ifs = [i for i in ifs if not _is_never_game_traffic(i.get("name"))]
                 if not ifs:
                     self.root.after(0, lambda: on_progress(
                         "warn", "沒有可掃描的介面 (無介面有有效 IPv4)"))
                     self.root.after(0, lambda: on_done(None, []))
                     return
 
+                # 預設路由那張排最前面:絕大多數情況遊戲就走這張,先掃到就能提早收工
+                preferred = default_route_iface()
+                ifs.sort(key=lambda i: i.get("name") != preferred)
+
                 total_time = len(ifs) * per_iface_timeout
                 self.root.after(0, lambda: on_progress(
-                    "info", f"開始掃描 {len(ifs)} 張介面,每張測 {per_iface_timeout} 秒 (總計約 {total_time} 秒)"))
+                    "info", f"開始掃描 {len(ifs)} 張介面,每張測 {per_iface_timeout} 秒 (最多約 {total_time} 秒)"))
 
                 hits = []
                 for iface in ifs:
@@ -1126,6 +1291,10 @@ class LiveDamageMonitor:
                         hits.append((iface, count, name))
                         self.root.after(0, lambda n=name, c=count: on_progress(
                             "ok", f"✓ {n}", f"收到 {c} 個目標封包"))
+                        # 預設路由那張已經收到流量就不必再試其他張,省下數十秒
+                        # (macOS 上虛擬介面動輒十幾張,全掃完使用者早就等到不耐煩)
+                        if iface_key == preferred:
+                            break
                     else:
                         self.root.after(0, lambda n=name: on_progress(
                             "info", f"  {n}", "沒收到"))
@@ -1148,6 +1317,160 @@ class LiveDamageMonitor:
             self.chosen_iface = None
             return
         self.chosen_iface = iface_dict.get("name")
+
+    # ================================================
+    # macOS: BPF 權限引導
+    #   /dev/bpf* 預設是 root:wheel 0600,不提權就抓不到封包。
+    #   .app 又沒有「以管理員身分執行」這種選項,所以第一次啟動時直接在
+    #   程式裡引導使用者做一次性設定,之後就不必再輸入密碼。
+    # ================================================
+    def _start_capture_access_flow(self):
+        """啟動流程第一步:確認抓包權限,不足時引導設定。
+        非 macOS、或已經有權限 (含以 sudo 執行),就直接進入網卡自動偵測。
+        """
+        if not IS_MACOS:
+            self._auto_detect_iface_on_startup()
+            return
+        ok, _ = check_capture_permission()
+        if ok:
+            self._auto_detect_iface_on_startup()
+            return
+        self._show_bpf_access_dialog()
+
+    def _bpf_helper_script_path(self):
+        """找出 macos-bpf-access.sh:打包版在 bundle 內,原始碼版在專案根目錄。"""
+        path = get_resource_path(BPF_HELPER_NAME)
+        if os.path.exists(path):
+            return path
+        alt = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), BPF_HELPER_NAME)
+        return alt if os.path.exists(alt) else None
+
+    def _show_bpf_access_dialog(self):
+        """說明清楚要改什麼、有什麼代價,再讓使用者決定。"""
+        win = ctk.CTkToplevel(self.root)
+        win.title("需要封包擷取權限")
+        win.geometry("500x430")
+        win.resizable(False, False)
+        win.transient(self.root)
+        # macOS 的 CTkToplevel 要延遲一下才吃得到 lift/grab,否則會躲到主視窗後面
+        win.after(150, lambda: (win.lift(), win.focus_force(), win.grab_set()))
+        self._bpf_dialog = win
+
+        ctk.CTkLabel(win, text="需要封包擷取權限",
+                     font=(FONT_UI, 16, "bold")).pack(pady=(18, 6))
+
+        body = (
+            "MM Scribe 需要讀取網路封包才能統計傷害,但 macOS 預設只允許\n"
+            "管理員存取封包擷取裝置 (/dev/bpf*),因此每次都得用 sudo 從\n"
+            "終端機啟動。\n\n"
+            "可以做一次性設定,之後直接點開就能用:\n\n"
+            "  1. 建立 access_bpf 群組,並把你的帳號加入\n"
+            "  2. 安裝一個開機執行的背景項目,把擷取裝置交給該群組\n\n"
+            "這與 Wireshark 的 ChmodBPF 是同一套做法,兩者可並存。"
+        )
+        ctk.CTkLabel(win, text=body, font=(FONT_UI, 12),
+                     justify="left").pack(padx=24, anchor="w")
+
+        warn = ("⚠ 設定後,該群組的成員不需要密碼就能監聽這台電腦上的\n"
+                "   所有網路流量。不想長期開著,隨時可以還原。")
+        ctk.CTkLabel(win, text=warn, font=(FONT_UI, 11),
+                     text_color="#ff9944", justify="left").pack(padx=24, pady=(12, 0), anchor="w")
+
+        self._bpf_status_label = ctk.CTkLabel(win, text="", font=(FONT_UI, 11),
+                                              text_color="#9ad", wraplength=440, justify="left")
+        self._bpf_status_label.pack(padx=24, pady=(10, 0), anchor="w")
+
+        btn_row = ctk.CTkFrame(win, fg_color="transparent")
+        btn_row.pack(pady=16)
+
+        script = self._bpf_helper_script_path()
+        self._bpf_setup_btn = ctk.CTkButton(
+            btn_row, text="設定 (需要輸入密碼)", width=190,
+            font=(FONT_UI, 12, "bold"), command=self._run_bpf_setup)
+        self._bpf_setup_btn.pack(side="left", padx=6)
+        if script is None:
+            # 找不到腳本就別給一個按了會失敗的按鈕
+            self._bpf_setup_btn.configure(state="disabled")
+            self._bpf_status_label.configure(
+                text=f"找不到 {BPF_HELPER_NAME},請改用 sudo 啟動,或從專案目錄執行該腳本。",
+                text_color="#ff6666")
+
+        ctk.CTkButton(btn_row, text="稍後再說", width=120,
+                      font=(FONT_UI, 12), fg_color="#555", hover_color="#666",
+                      command=self._skip_bpf_setup).pack(side="left", padx=6)
+
+    def _skip_bpf_setup(self):
+        """略過設定:照樣進入偵測流程,讓日誌把失敗原因寫出來。"""
+        try:
+            self._bpf_dialog.grab_release()
+            self._bpf_dialog.destroy()
+        except Exception:
+            pass
+        self.log("=== 未設定抓包權限,請改以 sudo 啟動,否則收不到封包 ===")
+        self._auto_detect_iface_on_startup()
+
+    def _run_bpf_setup(self):
+        """以系統授權對話框提權執行設定腳本 (背景執行,不凍結 UI)。"""
+        import shlex
+        import subprocess
+
+        script = self._bpf_helper_script_path()
+        if script is None:
+            return
+
+        self._bpf_setup_btn.configure(state="disabled")
+        self._bpf_status_label.configure(
+            text="等待授權中 — 請在系統跳出的對話框輸入密碼...", text_color="#9ad")
+
+        user = os.environ.get("USER") or ""
+
+        def _worker():
+            # 腳本用 /bin/bash 呼叫,不依賴檔案的執行權限 —
+            # PyInstaller 打包的 data file 不保證會保留 +x
+            inner = f"/bin/bash {shlex.quote(script)} install --yes"
+            if user:
+                inner += f" --user {shlex.quote(user)}"
+            # 內容要嵌進 AppleScript 的字串裡,反斜線與雙引號都得跳脫
+            esc = inner.replace("\\", "\\\\").replace('"', '\\"')
+            osa = f'do shell script "{esc}" with administrator privileges'
+            try:
+                proc = subprocess.run(["osascript", "-e", osa],
+                                      capture_output=True, text=True, timeout=180)
+                rc, err = proc.returncode, (proc.stderr or "").strip()
+            except Exception as e:
+                rc, err = -1, str(e)
+            self.root.after(0, lambda: self._on_bpf_setup_done(rc, err))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_bpf_setup_done(self, rc, err):
+        if rc != 0:
+            # osascript 在使用者按取消時回報 -128
+            cancelled = "-128" in err or "User canceled" in err
+            self._bpf_status_label.configure(
+                text="已取消授權。" if cancelled else f"設定失敗:{err[:150]}",
+                text_color="#ff9944" if cancelled else "#ff6666")
+            self._bpf_setup_btn.configure(state="normal")
+            return
+
+        ok, detail = check_capture_permission()
+        if ok:
+            try:
+                self._bpf_dialog.grab_release()
+                self._bpf_dialog.destroy()
+            except Exception:
+                pass
+            self.log("=== 抓包權限設定完成,之後啟動不需要再輸入密碼 ===")
+            self._auto_detect_iface_on_startup()
+            return
+
+        # 群組成員資格要新的 process 才會生效,這種情況重開程式即可
+        self._bpf_status_label.configure(
+            text="設定已完成,但這個程式的執行階段還沒取得新的群組身分。\n"
+                 "請關閉並重新開啟 MM Scribe。",
+            text_color="#ff9944")
+        self._bpf_setup_btn.configure(state="disabled")
 
     def _auto_detect_iface_on_startup(self):
         """程式開啟時的自動偵測 (背景執行,不阻擋 UI)。
@@ -1216,8 +1539,6 @@ class LiveDamageMonitor:
 
     def _run_network_checks(self):
         """執行所有網路環境檢測項目並輸出結果。"""
-        import ctypes
-
         area = self._netcheck_result
         area.configure(state="normal")
         area.delete("1.0", "end")
@@ -1232,27 +1553,25 @@ class LiveDamageMonitor:
         def section(title):
             area._textbox.insert("end", f"── {title} ──\n\n", "tag_header")
 
-        # === 1. 管理員權限 ===
+        # === 1. 抓包權限 ===
         section("1. 執行權限")
-        is_admin = False
-        try:
-            is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
-        except Exception:
-            pass
-        if is_admin:
-            write("ok", "以系統管理員身分執行", "scapy sniff 具備所需權限")
+        perm_ok, perm_detail = check_capture_permission()
+        if perm_ok:
+            write("ok", "已具備抓包權限", perm_detail)
         else:
-            write("fail", "非系統管理員權限",
+            write("fail", "權限不足",
                   "★ 這是抓不到封包最常見的原因 ★",
-                  "請關閉程式後對 exe 右鍵 → 「以系統管理員身分執行」")
+                  perm_detail)
 
-        # === 2. Npcap ===
-        section("2. Npcap 驅動")
-        if check_npcap_installed():
-            write("ok", "Npcap 驅動已安裝")
+        # === 2. 抓包驅動 ===
+        driver_name = "Npcap 驅動" if IS_WINDOWS else "libpcap / BPF"
+        section(f"2. {driver_name}")
+        backend_ok, backend_hint = check_capture_backend()
+        if backend_ok:
+            write("ok", f"{driver_name} 已就緒",
+                  *([] if IS_WINDOWS else ["libpcap 為 macOS 內建,無須另外安裝"]))
         else:
-            write("fail", "未偵測到 Npcap 驅動",
-                  "請至 https://npcap.com/ 下載並安裝")
+            write("fail", f"未偵測到 {driver_name}", backend_hint)
 
         # ── 共用工具 ──
         def extract_ipv4_list(raw):
@@ -1308,8 +1627,7 @@ class LiveDamageMonitor:
         # === 3. 網路介面 ===
         section("3. 網路介面偵測 (已過濾無 IPv4 的介面)")
         try:
-            from scapy.arch.windows import get_windows_if_list
-            ifs = get_windows_if_list()
+            ifs = list_network_ifaces()
             if not ifs:
                 write("warn", "沒有找到任何網路介面")
             else:
@@ -1323,11 +1641,15 @@ class LiveDamageMonitor:
                     ipv4 = extract_ipv4_list(i.get("ips"))
                     ip_str = ", ".join(ipv4) if ipv4 else "(無 IPv4)"
 
-                    lower_desc = desc.lower()
+                    # macOS 的 description 就是 BSD 名稱,所以連 name 一起比對:
+                    # utun=VPN, bridge/vmenet=虛擬機橋接, awdl/llw=AirDrop, feth/gif/stf=虛擬
+                    lower_desc = (desc + " " + name).lower()
                     tag = ""
                     if any(kw in lower_desc for kw in
                            ["virtual", "vmware", "vbox", "hyper-v", "tap", "tun",
-                            "wireguard", "wsl", "loopback"]):
+                            "wireguard", "wsl", "loopback",
+                            "utun", "bridge", "vmenet", "awdl", "llw", "feth",
+                            "gif", "stf", "anpi", "lo0"]):
                         tag = " ⚠虛擬/VPN"
 
                     if is_active_iface(i):
@@ -1343,14 +1665,13 @@ class LiveDamageMonitor:
         # === 4. scapy 目前綁定的介面 ===
         section("4. scapy 目前綁定介面")
         try:
-            from scapy.arch.windows import get_windows_if_list
             friendly = active_name
             desc = ""
             ipv4 = extract_ipv4_list(getattr(active_iface, "ips", None)) if active_iface_str else []
 
             # 沒抓到就從介面清單反查
             if active_iface_str and (not friendly or not ipv4):
-                for iface in get_windows_if_list():
+                for iface in list_network_ifaces():
                     if is_active_iface(iface):
                         if not friendly:
                             friendly = str(iface.get("description") or iface.get("name") or "")
@@ -1393,11 +1714,11 @@ class LiveDamageMonitor:
         header = ctk.CTkFrame(overlay, fg_color="transparent", height=44)
         header.pack(fill="x", padx=12, pady=(12, 0))
         ctk.CTkLabel(header, text="⚠ 免責聲明",
-                     font=("Microsoft JhengHei", 16, "bold"),
+                     font=(FONT_UI, 16, "bold"),
                      text_color="#ff9944").pack(side="left", padx=6)
         ctk.CTkButton(header, text="✕", width=32, height=32, corner_radius=16,
                       fg_color="#3a3a3a", hover_color="#c94a4a",
-                      font=("Consolas", 14, "bold"),
+                      font=(FONT_MONO, 14, "bold"),
                       command=self.hide_disclaimer).pack(side="right", padx=6)
 
         # 內文區
@@ -1418,7 +1739,7 @@ class LiveDamageMonitor:
             "    若不同意,請立即停止使用並刪除本程式。\n"
         )
         textbox = ctk.CTkTextbox(overlay, wrap="word",
-                                 font=("Microsoft JhengHei", 12),
+                                 font=(FONT_UI, 12),
                                  corner_radius=8, fg_color="#1a1a1a")
         textbox.pack(fill="both", expand=True, padx=16, pady=12)
         textbox.insert("end", content)
@@ -1447,11 +1768,11 @@ class LiveDamageMonitor:
         header = ctk.CTkFrame(overlay, fg_color="transparent", height=44)
         header.pack(fill="x", padx=12, pady=(12, 0))
         ctk.CTkLabel(header, text="⚙ 設定",
-                     font=("Microsoft JhengHei", 16, "bold"),
+                     font=(FONT_UI, 16, "bold"),
                      text_color="#88ccff").pack(side="left", padx=6)
         ctk.CTkButton(header, text="✕", width=32, height=32, corner_radius=16,
                       fg_color="#3a3a3a", hover_color="#c94a4a",
-                      font=("Consolas", 14, "bold"),
+                      font=(FONT_MONO, 14, "bold"),
                       command=self.hide_settings).pack(side="right", padx=6)
 
         # 用 ScrollableFrame,視窗過矮時內容自動可捲 (原本用 CTkFrame 會被截掉)
@@ -1462,20 +1783,20 @@ class LiveDamageMonitor:
         section = ctk.CTkFrame(body, fg_color="transparent")
         section.pack(fill="x", padx=12, pady=(12, 4))
         ctk.CTkLabel(section, text="── 顯示 ──",
-                     font=("Microsoft JhengHei", 12, "bold"),
+                     font=(FONT_UI, 12, "bold"),
                      text_color="#ffffff", anchor="w").pack(fill="x", pady=(0, 8))
 
         # 字體縮放列
         scale_row = ctk.CTkFrame(section, fg_color="transparent")
         scale_row.pack(fill="x", pady=4)
         ctk.CTkLabel(scale_row, text="字體縮放:", width=90,
-                     font=("Microsoft JhengHei", 12),
+                     font=(FONT_UI, 12),
                      anchor="w").pack(side="left", padx=(0, 8))
         # 顯示當前倍率的 Entry (唯讀,只當顯示用) + 右側 ▲▼ 兩顆微型按鈕
         # 每次 ▲ / ▼ 步進 0.1,夾在 FONT_SCALE_MIN ~ FONT_SCALE_MAX 之間
         self._scale_entry = ctk.CTkEntry(
             scale_row, width=64, justify="center",
-            font=("Consolas", 13, "bold"), corner_radius=6,
+            font=(FONT_MONO, 13, "bold"), corner_radius=6,
         )
         self._scale_entry.insert(0, f"{self.font_scale:.1f}x")
         self._scale_entry.configure(state="readonly")
@@ -1486,13 +1807,13 @@ class LiveDamageMonitor:
         ctk.CTkButton(
             step_col, text="▲", width=22, height=14, corner_radius=3,
             fg_color="#4a4a4a", hover_color="#6a6a6a",
-            font=("Consolas", 9),
+            font=(FONT_MONO, 9),
             command=lambda: self._step_scale(0.1),
         ).pack(pady=(0, 1))
         ctk.CTkButton(
             step_col, text="▼", width=22, height=14, corner_radius=3,
             fg_color="#4a4a4a", hover_color="#6a6a6a",
-            font=("Consolas", 9),
+            font=(FONT_MONO, 9),
             command=lambda: self._step_scale(-0.1),
         ).pack()
 
@@ -1506,39 +1827,39 @@ class LiveDamageMonitor:
         # 提示:視窗尺寸不會自動跟著縮放,由使用者手動調整
         ctk.CTkLabel(section,
                      text="※ 縮放後如視窗過小,請手動拖曳邊緣調整尺寸",
-                     font=("Microsoft JhengHei", 10),
+                     font=(FONT_UI, 10),
                      text_color="#888888", anchor="w").pack(fill="x", pady=(8, 0))
 
         # 獨立視窗 (popout) 選項
         popout_row = ctk.CTkFrame(section, fg_color="transparent")
         popout_row.pack(fill="x", pady=(10, 0))
         ctk.CTkLabel(popout_row, text="獨立視窗:", width=90,
-                     font=("Microsoft JhengHei", 12),
+                     font=(FONT_UI, 12),
                      anchor="w").pack(side="left", padx=(0, 8))
         ctk.CTkCheckBox(
             popout_row, text="攻擊事件日誌",
             variable=self.popout_log_var,
             command=self._on_popout_log_change,
             corner_radius=5, checkbox_width=18, checkbox_height=18,
-            font=("Microsoft JhengHei", 12),
+            font=(FONT_UI, 12),
         ).pack(side="left", padx=(0, 12))
         ctk.CTkCheckBox(
             popout_row, text="技能傷害排行",
             variable=self.popout_skill_var,
             command=self._on_popout_skill_change,
             corner_radius=5, checkbox_width=18, checkbox_height=18,
-            font=("Microsoft JhengHei", 12),
+            font=(FONT_UI, 12),
         ).pack(side="left", padx=(0, 8))
         ctk.CTkLabel(section,
                      text="※ 勾選後日誌會以獨立視窗開啟;直接關閉獨立視窗會自動收回主視窗",
-                     font=("Microsoft JhengHei", 10),
+                     font=(FONT_UI, 10),
                      text_color="#888888", anchor="w").pack(fill="x", pady=(4, 0))
 
         # ── 「追蹤」區塊 ──
         track_section = ctk.CTkFrame(body, fg_color="transparent")
         track_section.pack(fill="x", padx=12, pady=(16, 4))
         ctk.CTkLabel(track_section, text="── 追蹤 ──",
-                     font=("Microsoft JhengHei", 12, "bold"),
+                     font=(FONT_UI, 12, "bold"),
                      text_color="#ffffff", anchor="w").pack(fill="x", pady=(0, 8))
 
         ctk.CTkCheckBox(
@@ -1547,7 +1868,7 @@ class LiveDamageMonitor:
             variable=self.track_damage_var,
             command=self._on_track_damage_change,
             corner_radius=5, checkbox_width=18, checkbox_height=18,
-            font=("Microsoft JhengHei", 12),
+            font=(FONT_UI, 12),
         ).pack(anchor="w", pady=4)
 
         ctk.CTkCheckBox(
@@ -1556,30 +1877,30 @@ class LiveDamageMonitor:
             variable=self.track_heal_var,
             command=self._on_track_heal_change,
             corner_radius=5, checkbox_width=18, checkbox_height=18,
-            font=("Microsoft JhengHei", 12),
+            font=(FONT_UI, 12),
         ).pack(anchor="w", pady=4)
 
         ctk.CTkLabel(track_section,
                      text="※ 兩者可同時勾選;至少留一個開啟以免主畫面空白",
-                     font=("Microsoft JhengHei", 10),
+                     font=(FONT_UI, 10),
                      text_color="#888888", anchor="w").pack(fill="x", pady=(8, 0))
 
         # ── 「診斷」區塊 ──
         diag_section = ctk.CTkFrame(body, fg_color="transparent")
         diag_section.pack(fill="x", padx=12, pady=(16, 4))
         ctk.CTkLabel(diag_section, text="── 診斷 ──",
-                     font=("Microsoft JhengHei", 12, "bold"),
+                     font=(FONT_UI, 12, "bold"),
                      text_color="#ffffff", anchor="w").pack(fill="x", pady=(0, 8))
 
         diag_row = ctk.CTkFrame(diag_section, fg_color="transparent")
         diag_row.pack(fill="x", pady=4)
         ctk.CTkLabel(diag_row, text="網路環境:", width=90,
-                     font=("Microsoft JhengHei", 12),
+                     font=(FONT_UI, 12),
                      anchor="w").pack(side="left", padx=(0, 8))
         ctk.CTkButton(diag_row, text="🌐 網路檢測",
                       width=120, corner_radius=6,
                       fg_color="#3a6a9a", hover_color="#4a7ab0",
-                      font=("Microsoft JhengHei", 11),
+                      font=(FONT_UI, 11),
                       command=self.show_network_check).pack(side="left", padx=(0, 8))
 
     def hide_settings(self):
@@ -1714,11 +2035,17 @@ class LiveDamageMonitor:
 
     def _on_skill_wheel_all(self, event):
         """統一的 wheel handler,直接操作 skill_scroll 內部的 canvas。
-        除數用 /40 與 CTk 內建速度換算一致,再乘以 SCROLL_SPEED 加倍 (預設 3x)。
+
+        平台差異:Windows 的 event.delta 是 ±120 的倍數,除以 40 換算成捲動格數
+        (與 CTk 內建速度一致);macOS Tk 送出的 delta 已經是格數本身 (±1~3),
+        再除 40 會被整數截斷成 0,滾輪等同失效,所以直接使用原值。
         """
         SCROLL_SPEED = 3
         try:
-            step = int(-event.delta / 40) * SCROLL_SPEED
+            if IS_MACOS:
+                step = int(-event.delta) * SCROLL_SPEED
+            else:
+                step = int(-event.delta / 40) * SCROLL_SPEED
             self.skill_scroll._parent_canvas.yview_scroll(step, "units")
         except Exception:
             pass
@@ -1768,7 +2095,7 @@ class LiveDamageMonitor:
 
         # 詳細統計:字體與技能列 name 相同 (12pt bold),展開時才 pack
         detail_lbl = ctk.CTkLabel(container, text="", anchor="w",
-                                   font=("Microsoft JhengHei", 12, "bold"),
+                                   font=(FONT_UI, 12, "bold"),
                                    text_color="#88ccff")
 
         row = {
