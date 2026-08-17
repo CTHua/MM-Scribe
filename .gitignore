@@ -6,3 +6,6 @@ dist/
 *.spec
 RELEASE.marker
 .DS_Store
+CLAUDE.md
+Note/Ref/
+Release/

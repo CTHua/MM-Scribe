@@ -1,4 +1,4 @@
-"""
+﻿"""
 瑪奇即時傷害監控 - customtkinter 版
 需求: pip install customtkinter scapy
 抓封包需要提權:Windows 以系統管理員執行;macOS 需 root 或已放寬 /dev/bpf* 權限。
@@ -8,19 +8,20 @@ macOS 上遊戲為 iOS App on Mac,流量直接走實體網卡,抓法與 Windows 
 
 打包說明:
   Windows 開發版 (顯示開發者選項):
-    python -m PyInstaller --onefile --noconsole --collect-data customtkinter MabinogiMobileScribe_Beta_V0.43.py
+    python -m PyInstaller --onefile --noconsole --collect-data customtkinter MabinogiMobileScribe_Beta_V0.50.py
 
   Windows 發布版 (隱藏開發者選項):
     type nul > RELEASE.marker
-    python -m PyInstaller --onefile --noconsole --collect-data customtkinter --add-data "RELEASE.marker;." MabinogiMobileScribe_Beta_V0.43.py
+    python -m PyInstaller --onefile --noconsole --collect-data customtkinter --add-data "RELEASE.marker;." MabinogiMobileScribe_Beta_V0.50.py
 
   macOS (--add-data 分隔符是 ':' 不是 ';'):
     touch RELEASE.marker
-    python -m PyInstaller --windowed --collect-data customtkinter --add-data "RELEASE.marker:." MabinogiMobileScribe_Beta_V0.43.py
+    python -m PyInstaller --windowed --collect-data customtkinter --add-data "RELEASE.marker:." MabinogiMobileScribe_Beta_V0.50.py
 
   程式啟動時會偵測執行檔內是否包含 RELEASE.marker 檔案,
   存在則隱藏開發者選項按鈕(釋出給他人使用)。
 """
+import collections
 import configparser
 import os
 import struct
@@ -28,9 +29,21 @@ import sys
 import threading
 import time
 import tkinter as tk  # 只用 StringVar / BooleanVar
+import tkinter.font as tkfont  # 日誌技能欄的像素寬度量測
 import webbrowser
 import customtkinter as ctk
 from scapy.all import sniff, TCP, IP
+
+# Brotli 為「選用」相依 — 只有開發者模式的封包普查會用到 (encodingType==1 的
+# content 是 Brotli,見 protocol §1)。沒安裝時普查照跑,只是看不到解壓內容,
+# 其餘功能完全不受影響,因此不列入打包硬相依。
+try:
+    import brotli as _BROTLI
+except ImportError:
+    try:
+        import brotlicffi as _BROTLI
+    except ImportError:
+        _BROTLI = None
 
 # ----------------------------------------------------
 # 平台差異
@@ -38,13 +51,18 @@ from scapy.all import sniff, TCP, IP
 IS_WINDOWS = sys.platform == "win32"
 IS_MACOS = sys.platform == "darwin"
 
-# 字體:兩邊都需要「中文 UI 字體 + 等寬數字字體」,等寬是傷害欄位對齊的前提
+# 字體:FONT_UI 是介面主字體,FONT_MONO 只留給開發者診斷 LOG (hex dump 需要等寬)
 if IS_MACOS:
     FONT_UI = "PingFang TC"
     FONT_MONO = "Menlo"
 else:
     FONT_UI = "Microsoft JhengHei"
     FONT_MONO = "Consolas"
+# 攻擊 / 治癒日誌一律走 UI 字體 (Windows = 微軟正黑體),不再混用等寬字 —
+# 混用時中文會從等寬字 fallback 到系統 CJK 字體,同一行看起來字重不一致。
+# 傷害欄的右對齊改由 Tk 的 right tab stop 負責 (見 _scaled_tab_stops),
+# 不再靠空白補齊,所以不需要等寬字也能對齊。
+FONT_LOG = FONT_UI
 
 
 def is_release_build():
@@ -62,8 +80,18 @@ def is_release_build():
 # ----------------------------------------------------
 # 設定
 # ----------------------------------------------------
-VERSION_STR = "Beta V0.43"
+VERSION_STR = "Beta V0.50"
 COVERAGE_MIN_HITS = 10  # 覆蓋率計算所需最少樣本數
+# 需要統計覆蓋率的標籤 (上方面板、技能排行展開明細共用同一份;順序即顯示順序)
+COVERAGE_TAGS = ("爆擊", "強擊", "連擊", "追擊")
+# 目標篩選:TARGET_ALL 是「全部對象」的彙總桶,其餘 key 為 target_id (int)
+TARGET_ALL = "__ALL__"
+TARGET_ALL_LABEL = "All"
+TARGET_BTN_SELECTED = "#3a6a9a"    # 目標按鈕:選中
+TARGET_BTN_IDLE = "#2a2a2a"        # 目標按鈕:未選中
+TARGET_SORT_INTERVAL_MS = 3000     # 目標按鈕列依累積傷害重排的週期
+# 攻擊日誌保留筆數上限 (切換目標時要依此緩衝重畫整份,故需有上界)
+LOG_HISTORY_MAX = 5000
 SKILL_CFG_NAME = "skills.ini"
 SETTINGS_CFG_NAME = "settings.ini"
 BPF_HELPER_NAME = "macos-bpf-access.sh"  # macOS 抓包權限設定腳本
@@ -71,14 +99,106 @@ FONT_SCALE_MIN = 1.0
 FONT_SCALE_MAX = 2.0
 FONT_SCALE_DEFAULT = 1.0
 MERGE_GROUP_SECTION = "合併群組"
+# 註:舊版的「忽略寵物攻擊」設定已移除 — 統計改用角色 ID 門檻 (只收攻擊者 == 自己的
+# 傷害),寵物是獨立實體,本來就不會進統計。skills.ini 的 [寵物] 區段仍照常提供技能名。
 # Skill ID 提取 (見 HEAL_SHIELD_SKILL_ID.md §4)
 HEAL_SHIELD_SKILL_NEAR_WINDOW = 300  # Near 掃描單向視窗大小 (bytes)
 ALT_SKILL_MAX_GAP = 8                # 0x1ADE8 允許緊接 0x4EED 結束後的最大 gap
 ALT_SKILL_BACKSCAN = 64              # 往前找 0x4EED 的搜尋深度
+# 傷害旗標區 (見 MM_Scribe_PacketNotes_Damage.md §4)
+# 0x51E9 事件的旗標是連續 7 bytes: payload[offset+41 .. offset+47]
+#   flags[0] = b41 (已用), flags[1] = b42 (已用), flags[2..6] = b43..b47 (診斷中)
+DMG_FLAG_BASE = 41
+DMG_FLAG_LEN = 7
+# 持續傷害 (DoT) — 2026-08-16 以 5 組樣本修正
+#   判定只看 b45 bit4 一個位元。對照組:
+#     被動毒DOT   flags 00 88 01 00 14 → DoT
+#     3技創傷DOT  flags 00 88 01 10 10 → DoT
+#     4技毒DOT    flags 00 88 01 00 14 → DoT
+#     2技追加傷害 flags 05 88 01 00 00 → 非 DoT
+#     4技地面傷害 flags 01 88 01 00 04 → 非 DoT
+#   佐證:真 DoT 的 b41 恆為 00 (不會爆擊) 且每跳數值固定;追加/地面傷害兩者皆否。
+DMG_DOT_BITS = ((4, 0x10),)
+DMG_DOT_SUFFIX = "(Dot)"
+# 「非直接命中的額外傷害」通用標記 — DoT / 追加傷害 / 地面傷害都會亮,
+# 因此不足以判定 DoT (舊版誤把這組當成 DoT,導致追加傷害被標成 Dot)。
+# 目前僅供開發者面板診斷,不影響統計。
+DMG_EXTRA_BITS = ((1, 0x08), (1, 0x80), (2, 0x01))
+# 開發者模式用:把上面兩組拆回「是哪幾個 bit 亮的」。格式: (flags index, mask, 標籤)
+DMG_DOT_BIT_LABELS = ((4, 0x10, "45.10"),)
+DMG_EXTRA_BIT_LABELS = ((1, 0x08, "42.08"), (1, 0x80, "42.80"), (2, 0x01, "43.01"))
+# 追擊 (add_hit_flag) — 位置來自 packet-protocol.md, 本地尚未錄到樣本驗證。
+# 已納入正式標籤與覆蓋率統計; 若實測發現誤判, 只要改這一組常數即可。
+DMG_ADD_HIT_BIT = (3, 0x08)
+# 以下位元語意來自第三方整理的 packet-protocol.md, 尚未用本地樣本驗證,
+# 目前「只在開發者模式顯示」, 不進入正式標籤 / 統計。
+# 格式: (flags index, mask, 顯示名稱)
+DMG_FLAG_CANDIDATES = (
+    # 出血/毒 已於 2026-08-16 由多個技能交叉驗證 (創傷 DOT = 出血;三個毒技能 = 毒),
+    # 其餘元素仍未錄到樣本,一律保留 "?" 提醒。
+    (3, 0x10, "出血"), (3, 0x20, "暗?"), (3, 0x40, "火?"), (3, 0x80, "聖?"),
+    (4, 0x01, "冰?"), (4, 0x02, "雷?"), (4, 0x04, "毒"), (4, 0x08, "心?"),
+)
+# ---- 角色身分偵測 (規則來自 Note/Ref/for-mm-scribe-identity.md) ----
+# 尚未用本地樣本驗證,純觀測:只寫開發者 LOG,不影響任何統計。
+#
+# 前提:實體 ID (entityId) 換場景就換,角色身分 (帳號碼 + 角色索引) 永遠不變。
+# 認出「自己」不是靠某個旗標,是把兩者對上 —— 先知道自己的身分,再反查哪個
+# 實體 ID 的身分跟自己一樣。比對鍵**兩個都要相等**:只比帳號碼會綁到同帳號
+# 的別隻角色,只比角色索引會撞到別的帳號 (索引 4、5 這種小數字滿地都是)。
+#
+#   A. 我的角色資料 0x4FFF — 遊戲只發給本人,unframed、enc=1。
+#      解壓後前 8 bytes: [u16 characterIndex][u32 accountInfo][u16 reserved(必須=0)]
+#   B. 玩家出現   0x4E4F — 每個玩家進視野時送,framed、enc=1。
+#      解壓後前 4 bytes 是 entityId,內文某處有
+#      u64 characterId = accountInfo << 16 | characterIndex
+#
+# 兩個方向都要做:A 先到就回頭掃已快取的 B;B 先到就在每次有人出現時順手比對。
+# 換場景 → 實體 ID 變、身分不清,拿身分重新綁定;換角色 → A 的身分變了,清掉舊綁定。
+#
+# **本工具不做 TCP 重組**,而 A 訊息壓縮後可達 170KB+、會跨上百個封包。
+# 這裡的做法是「串流解壓器邊收邊餵,只要吐得出前 8 bytes 就收工」——
+# 能不能成立取決於 brotli 在只收到開頭幾 KB 時肯不肯吐 output,**待實測**。
+IDENT_SELF_TYPE = 0x4FFF
+IDENT_APPEAR_TYPE = 0x4E4F
+IDENT_SELF_MIN_SIZE = 1024        # A 訊息很大;太小的多半是對錯位撞出來的假標頭
+IDENT_SELF_FEED_MAX = 1 << 18     # 餵超過這麼多 bytes 還吐不出 8 bytes 就放棄本則
+IDENT_APPEAR_MIN_SIZE = 64        # B 訊息實測 1100~1300 bytes;放寬下限只擋明顯假的
+IDENT_APPEAR_HEAD_BYTES = 4096    # B 訊息解壓前幾 bytes,拿來找 characterId
+IDENT_APPEAR_CACHE_MAX = 64       # 身分還沒到手前,先留這麼多筆 B 訊息回頭比對
+IDENT_MAX_SIZE = 1 << 20          # contentLength 上限 (超過視為對錯位撞出來的假標頭)
+IDENT_STREAM_MAX = 8              # 同時追蹤幾條 TCP 連線的「收到一半的訊息」
+# 攻擊事件日誌上的角色 ID 狀態列 (紅字 / 綠字)。沒有角色 ID 時傷害一律不記錄,
+# 所以這行要直接出現在使用者天天在看的日誌上,不能只留在開發者面板。
+IDENT_MSG_NONE = "尚未偵測到角色ID，請嘗試更換地圖或重新登入來獲取角色ID"
+IDENT_MSG_OK = "已獲得角色ID資訊"
+# 「⚡ 強制偵測」旁的 ? 提示 (見 toggle_force_all)
+FORCE_ALL_TIP = ("無視角色 ID 偵測,把所有解析到的傷害全部納入統計。\n"
+                 "包含隊友、寵物、敵人打的傷害,數據不再只屬於你自己。\n"
+                 "只在角色 ID 一直偵測不到時當作應急手段;切換時會清除已累積的統計。")
+TOOLTIP_DELAY_MS = 400            # 滑鼠停留多久才跳提示
+# ---- 底部診斷 LOG 區塊 ----
+# 收合狀態只顯示最新一行,點一下彈出完整視窗 (見 dev_log / _popout_dev)
+DEV_LOG_MAX = 800                 # 緩衝保留幾行 (超過丟最舊的)
+DEV_STRIP_MAX_CHARS = 160         # 單行顯示上限,超過截斷加省略號
+DEV_STRIP_EMPTY = "🛠 診斷 LOG — 尚無訊息  (點擊展開)"
+IDENT_SELF_MAGIC = struct.pack("<I", IDENT_SELF_TYPE)
+IDENT_APPEAR_MAGIC = struct.pack("<I", IDENT_APPEAR_TYPE)
 DISCORD_INVITE_URL = "https://discord.gg/NaddqvBVvb"
-# 日誌欄位停靠點 (像素位置,交給 Text widget tab stop 對齊)
-# 布局: [技能名稱] \t [傷害值 (右對齊)] \t [標籤]
-LOG_TAB_STOPS = ("130", "240")
+# 日誌欄位布局: \t [傷害值 (右對齊)] \t [標籤 (左對齊)] \t [技能名稱 (可往右溢出)]
+# 行首那個 tab 是必要的 — Tk 的 right tab stop 對齊的是「tab 之後到下一個 tab」的字,
+# 第一欄要右對齊就得先有一個 tab 把它推到停靠點。
+# 傷害值放第一欄且右緣固定,結構上不可能被其他欄位推走。
+# 停靠點不寫死像素 — FONT_LOG 在 Windows(微軟正黑體)/macOS(PingFang TC) 字寬不同,
+# 改成依實際字體量測樣本字串算出 (見 _scaled_tab_stops)
+LOG_DMG_WIDTH = 10                      # 傷害欄右緣位置的取樣寬度 (幾個數字寬)
+LOG_DMG_SAMPLE = "9,999,999,999"        # 傷害欄取樣 (涵蓋 UInt32 上限位數)
+LOG_TAG_SAMPLE = "[爆擊+破防+多重打擊]"   # 標籤欄取樣;更長的組合會把名稱往右推,可接受
+LOG_COL_GAP = 10                        # 欄間留白
+# 標籤欄起點只留 LOG_DMG_GAP 的空隙:傷害欄的右緣就在 LOG_DMG_WIDTH 個數字寬處,
+# 不必為取樣字串的完整寬度讓位。技能名欄的起點仍以取樣字串為準(位置不變),
+# 縮掉的空間讓給標籤欄。單筆傷害寬過停靠點時 Tk 會改成從停靠點左對齊,只推開該行的標籤。
+LOG_DMG_GAP = 11
 RELEASE_BUILD = is_release_build()
 
 
@@ -414,7 +534,7 @@ def _is_never_game_traffic(name):
 
 
 IP_FILTER_NET = "43.0.0.0/8"
-HIGHLIGHT_OPTIONS = ["無", "爆擊", "強擊", "破防", "無防備", "連擊", "多重打擊"]
+HIGHLIGHT_OPTIONS = ["無", "爆擊", "強擊", "破防", "無防備", "連擊", "多重打擊", "追擊"]
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")
@@ -432,12 +552,12 @@ class LiveDamageMonitor:
         ctk.set_window_scaling(self.font_scale)
 
         self.root.title(f"MM Scribe {VERSION_STR}")
-        # 初始高度 680;每個 popout 中的 pane 從初值扣 200,啟動就用正確高度,
+        # 初始高度 780;每個 popout 中的 pane 從初值扣 200,啟動就用正確高度,
         # 不能在 __init__ 尾端做 delta 調整 — 那時 winfo_height() 因視窗尚未 realize
         # 回傳 1,dcalc 後會被 clamp 到 200 → 主視窗變超小、看不到開始按鈕
         # 340 是「dmg_banner + 3 條控制列 + status_bar + padding」的合理下限,
         # 保證兩個都 popout 時也看得到計時器那排
-        initial_h = 680
+        initial_h = 780
         if self.settings.get("popout_log", False):
             initial_h -= 200
         if self.settings.get("popout_skill", False):
@@ -469,37 +589,53 @@ class LiveDamageMonitor:
         self.root.minsize(400, 180)
 
         # 狀態變數
-        self.total_damage = 0
-        self.entity_map = {}
-        self.entity_count = 0
         self.is_monitoring = False
         self.sniff_thread = None
         self.is_topmost = False
-        self.is_dev_mode = False
-        self.first_damage_time = None
-        self.last_damage_time = None
+        # 診斷 LOG 現在是常駐區塊,沒有開關;發布版沒有 UI 入口就別花時間組字串
+        self.is_dev_mode = not RELEASE_BUILD
+        # 強制偵測 (見 toggle_force_all)。parse_payload 跑在 sniff 執行緒,
+        # 讀這個 attribute 而不是 tk 變數 — 別在那條執行緒碰 tk widget。
+        self.force_all = False
+        self._tooltip_win = None
+        self._tooltip_after_id = None
+        # 角色身分偵測狀態 (見 _ident_reset / _scan_identity)。
+        # 攔截執行緒獨立於「開始/停止」— 換地圖時的 0x4FFF/0x4E4F 一輩子只送那一次,
+        # 沒在收就永遠錯過,所以程式一啟動就開始收 (見 _ensure_sniffer)。
+        self._ident_reset()
+        # 攔截執行緒世代編號:換網卡時 +1,舊執行緒下一個封包就自行退出
+        self._sniff_gen = 0
 
-        # 標籤覆蓋率統計 (資料筆數達 COVERAGE_MIN_HITS 才顯示)
-        self.total_hits = 0
-        self.tag_counts = {"爆擊": 0, "強擊": 0, "連擊": 0}
+        # === 傷害統計:依攻擊對象分桶 ===
+        # target_stats: {TARGET_ALL 或 target_id(int) → stat bucket}
+        #   每筆傷害會同時累加到 TARGET_ALL 與該筆的 target_id 兩個桶,
+        #   畫面永遠只讀「目前選取的那一桶」(見 _view)。
+        # target_order:  target_id 依首次出現順序,決定下拉選單排列
+        # selected_target: 目前選取的 key (TARGET_ALL 或某個 target_id)
+        self.target_stats = {TARGET_ALL: self._new_stat_bucket()}
+        self.target_order = []
+        self.selected_target = TARGET_ALL
+        self.target_buttons = {}      # key (TARGET_ALL 或 target_id) → CTkButton
+        self._target_sort_after_id = None   # 目標排序輪詢的 after id
 
-        # 技能傷害排行
-        # skill_damage:    依 skill_id 累積的原始傷害
-        # skill_hits:      依 skill_id 累積的命中次數 (含未攜帶標籤的普通擊)
-        # skill_tag_counts: 依 skill_id 累積各標籤次數 (爆擊/強擊/連擊)
-        # skill_rows:      已建立的顯示列 (以聚合後的 display name 為 key)
-        self.skill_damage = {}
-        self.skill_hits = {}
-        self.skill_tag_counts = {}
+        # 攻擊事件緩衝:切換目標時要重畫日誌,所以每筆都要留下結構化紀錄。
+        # deque(maxlen) 超量會自動丟最舊的,不必手動修剪。
+        self.log_entries = collections.deque(maxlen=LOG_HISTORY_MAX)
+
+        # 日誌欄寬量測用的字體 (見 _scaled_tab_stops);字體物件需要 Tk root,
+        # 故延後到第一次用到時才建立
+        self._log_font = None
+
+        # skill_rows: 已建立的顯示列 (以聚合後的 display name 為 key)
         self.skill_rows = {}
 
         # 用 CTkFont 給 tk.Canvas 的技能列文字使用,才能跟 CTkLabel (detail) 走
         # 同一套字體/縮放管線 (widget_scaling × DPI scaling 都會自動套用),
         # 兩邊視覺大小一致。共用同一份 font instance,scale 變更時 CTk 會自動更新。
         self._skill_name_font = ctk.CTkFont(
-            family=FONT_UI, size=12, weight="bold")
+            family=FONT_UI, size=12, weight="normal")
         self._skill_value_font = ctk.CTkFont(
-            family=FONT_MONO, size=12, weight="bold")
+            family=FONT_LOG, size=12, weight="normal")
 
         # Resize debounce: 拖窗期間暫停技能排行更新,停下 150ms 後補一次
         self._is_resizing = False
@@ -526,6 +662,10 @@ class LiveDamageMonitor:
         self.popout_skill_var = tk.BooleanVar(value=self.popout_skill)
         self._log_popout_win = None
         self._skill_popout_win = None
+        # 診斷 LOG 展開視窗:一律獨立 Toplevel (底部區塊點一下才開)
+        self._dev_popout_win = None
+        # 診斷 LOG 緩衝:底部區塊與展開視窗都從這裡取內容 (見 dev_log)
+        self._dev_lines = collections.deque(maxlen=DEV_LOG_MAX)
 
         # 提前建立 collapse 狀態與 merge_var,讓 pane 重建 (dock/popout) 時值可延續
         self.log_collapsed = False
@@ -547,43 +687,45 @@ class LiveDamageMonitor:
         # ----------------------------------------------------
         self.dmg_banner = ctk.CTkFrame(root, corner_radius=0, fg_color="#1a1a1a")
 
+        # 目標選擇列已移到「計時器列與攻擊事件日誌之間」(見 3.6 節)
+
         # -- 主要統計列: 累積傷害 + DPS --
         main_row = ctk.CTkFrame(self.dmg_banner, fg_color="transparent")
-        main_row.pack(fill="x")
+        main_row.pack(fill="x", pady=(8, 0))
 
         left_stats = ctk.CTkFrame(main_row, corner_radius=0, fg_color="transparent")
         left_stats.pack(side="left", expand=True, fill="x", padx=10, pady=(8, 4))
         ctk.CTkLabel(left_stats, text="累積傷害",
-                     font=(FONT_UI, 12, "bold"),
+                     font=(FONT_UI, 12),
                      text_color="#888888").pack()
         self.lbl_total_dmg = ctk.CTkLabel(left_stats, text="0",
-                                          font=(FONT_MONO, 24, "bold"),
+                                          font=(FONT_LOG, 24),
                                           text_color="#ff4d4d")
         self.lbl_total_dmg.pack(pady=(2, 0))
 
         right_stats = ctk.CTkFrame(main_row, corner_radius=0, fg_color="transparent")
         right_stats.pack(side="right", expand=True, fill="x", padx=10, pady=(8, 4))
         ctk.CTkLabel(right_stats, text="DPS (每秒傷害)",
-                     font=(FONT_UI, 12, "bold"),
+                     font=(FONT_UI, 12),
                      text_color="#888888").pack()
         self.lbl_dps = ctk.CTkLabel(right_stats, text="0",
-                                    font=(FONT_MONO, 24, "bold"),
+                                    font=(FONT_LOG, 24),
                                     text_color="#ffcc4d")
         self.lbl_dps.pack(pady=(2, 0))
 
-        # -- 覆蓋率列: 爆擊 / 強擊 / 連擊 (資料筆數 < COVERAGE_MIN_HITS 時顯示「—」) --
+        # -- 覆蓋率列: COVERAGE_TAGS (資料筆數 < COVERAGE_MIN_HITS 時顯示「—」) --
         cov_row = ctk.CTkFrame(self.dmg_banner, fg_color="transparent")
         cov_row.pack(fill="x", pady=(0, 8))
 
         self.lbl_cov = {}
-        for tag_name in ("爆擊", "強擊", "連擊"):
+        for tag_name in COVERAGE_TAGS:
             col = ctk.CTkFrame(cov_row, fg_color="transparent")
             col.pack(side="left", expand=True, fill="x", padx=4)
             ctk.CTkLabel(col, text=f"{tag_name}覆蓋率",
-                         font=(FONT_UI, 12, "bold"),
+                         font=(FONT_UI, 12),
                          text_color="#888888").pack()
             lbl = ctk.CTkLabel(col, text="—",
-                               font=(FONT_MONO, 16, "bold"),
+                               font=(FONT_LOG, 16),
                                text_color="#88ccff")
             lbl.pack()
             self.lbl_cov[tag_name] = lbl
@@ -599,10 +741,10 @@ class LiveDamageMonitor:
         heal_total_col = ctk.CTkFrame(heal_total_row, fg_color="transparent")
         heal_total_col.pack(expand=True, fill="x", padx=10, pady=(8, 4))
         ctk.CTkLabel(heal_total_col, text="治癒總量",
-                     font=(FONT_UI, 12, "bold"),
+                     font=(FONT_UI, 12),
                      text_color="#888888").pack()
         self.lbl_heal_total = ctk.CTkLabel(heal_total_col, text="0",
-                                            font=(FONT_MONO, 24, "bold"),
+                                            font=(FONT_LOG, 24),
                                             text_color="#4dd471")
         self.lbl_heal_total.pack(pady=(2, 0))
 
@@ -612,24 +754,24 @@ class LiveDamageMonitor:
         self_col = ctk.CTkFrame(heal_sub_row, fg_color="transparent")
         self_col.pack(side="left", expand=True, fill="x", padx=4)
         ctk.CTkLabel(self_col, text="自身治癒",
-                     font=(FONT_UI, 11, "bold"),
+                     font=(FONT_UI, 11),
                      text_color="#888888").pack()
         self.lbl_heal_self = ctk.CTkLabel(self_col, text="0",
-                                           font=(FONT_MONO, 16, "bold"),
+                                           font=(FONT_LOG, 16),
                                            text_color="#4dd471")
         self.lbl_heal_self.pack()
         ally_col = ctk.CTkFrame(heal_sub_row, fg_color="transparent")
         ally_col.pack(side="left", expand=True, fill="x", padx=4)
         ctk.CTkLabel(ally_col, text="隊友治癒",
-                     font=(FONT_UI, 11, "bold"),
+                     font=(FONT_UI, 11),
                      text_color="#888888").pack()
         self.lbl_heal_ally = ctk.CTkLabel(ally_col, text="0",
-                                           font=(FONT_MONO, 16, "bold"),
+                                           font=(FONT_LOG, 16),
                                            text_color="#88ccff")
         self.lbl_heal_ally.pack()
 
         # ----------------------------------------------------
-        # 2. 控制列 Row 1: 啟停/清除/置頂/開發者
+        # 2. 控制列 Row 1: 啟停/清除/置頂/強制偵測
         # ----------------------------------------------------
         self.ctrl_row1 = ctk.CTkFrame(root, corner_radius=0)
         self.ctrl_row1.pack(fill="x", padx=10, pady=3)
@@ -653,12 +795,27 @@ class LiveDamageMonitor:
         ctk.CTkCheckBox(ctrl_row1, text="📌 置頂", variable=self.topmost_var,
                         command=self.toggle_topmost, corner_radius=5,
                         checkbox_width=18, checkbox_height=18).pack(side="left", padx=(8, 4), pady=6)
-        self.dev_var = tk.BooleanVar(value=False)
-        # 發布版隱藏開發者選項按鈕 (dev_var 保留供後續程式碼安全存取,但沒有 UI 也永不觸發)
-        if not RELEASE_BUILD:
-            ctk.CTkCheckBox(ctrl_row1, text="🛠 開發者", variable=self.dev_var,
-                            command=self.toggle_dev_mode, corner_radius=5,
-                            checkbox_width=18, checkbox_height=18).pack(side="left", padx=4, pady=6)
+        # 強制偵測:身分門檻的逃生門 (見 toggle_force_all)。不記進 settings.ini,
+        # 每次啟動預設關閉 — 開著它拿到的數據不只屬於自己,不該在使用者不知情下沿用。
+        # 發布版也要顯示 (跟「開發者」不同):角色 ID 偵測失敗時這是唯一的救急手段。
+        self.force_all_var = tk.BooleanVar(value=False)
+        # width 收窄:CTkCheckBox 預設 100,四個字用不完,尾巴的空白會把 ? 推很遠
+        ctk.CTkCheckBox(ctrl_row1, text="強制偵測", variable=self.force_all_var,
+                        command=self.toggle_force_all, corner_radius=5, width=80,
+                        checkbox_width=18, checkbox_height=18).pack(side="left", padx=(8, 0), pady=6)
+        # 說明鈕:圓圈裡一個問號。不用 Unicode 的 ⓘ / ❔ (字型支援不一,實際長相看系統),
+        # 改成正方形 CTkLabel + corner_radius=一半邊長 — 畫出來就是實心圓,配色跟著主題走
+        self._force_tip_btn = ctk.CTkLabel(
+            ctrl_row1, text="?", width=18, height=18, corner_radius=9,
+            fg_color="#3a3a3a", text_color="#cccccc", font=(FONT_UI, 11))
+        self._force_tip_btn.pack(side="left", padx=(5, 4), pady=6)
+        self._bind_tooltip(self._force_tip_btn, FORCE_ALL_TIP)
+        # 滑過時亮一點,讓人知道它是可互動的
+        self._force_tip_btn.bind(
+            "<Enter>", lambda _e: self._force_tip_btn.configure(fg_color="#5a5a5a"), add="+")
+        self._force_tip_btn.bind(
+            "<Leave>", lambda _e: self._force_tip_btn.configure(fg_color="#3a3a3a"), add="+")
+        # 「🛠 開發者」勾選已移除 — 診斷 LOG 改為視窗底部的常駐區塊 (見 §6)
 
         # ----------------------------------------------------
         # 3. 控制列 Row 2: 標籤高亮 + 視窗透明度
@@ -669,9 +826,11 @@ class LiveDamageMonitor:
 
         ctk.CTkLabel(ctrl_row2, text="🎯 高亮:").pack(side="left", padx=(8, 3), pady=6)
         self.highlight_var = tk.StringVar(value="無")
+        # 切換高亮後整份日誌重畫,舊事件也跟著改色 (紅字判定在 _insert_log_line 即時算)
         self.highlight_combo = ctk.CTkComboBox(ctrl_row2, values=HIGHLIGHT_OPTIONS,
                                                variable=self.highlight_var, state="readonly",
-                                               width=95, corner_radius=8)
+                                               width=95, corner_radius=8,
+                                               command=lambda _v: self._render_log())
         self.highlight_combo.pack(side="left", padx=(0, 8), pady=6)
 
         ctk.CTkLabel(ctrl_row2, text="🪟 透明度:").pack(side="left", padx=(4, 3), pady=6)
@@ -709,9 +868,27 @@ class LiveDamageMonitor:
         self._btn_timer_idle_hover = self.btn_timer.cget("hover_color")
 
         self.lbl_timer_remaining = ctk.CTkLabel(ctrl_row3, text="",
-                                                 font=(FONT_MONO, 13, "bold"),
+                                                 font=(FONT_LOG, 13),
                                                  text_color="#88ccff")
         self.lbl_timer_remaining.pack(side="left", padx=(0, 8), pady=6)
+
+        # ----------------------------------------------------
+        # 3.6 目標選擇列: 決定看板 + 技能排行 + 日誌顯示哪個攻擊對象的資料
+        #     緊貼在攻擊事件日誌上方 (packing 交給 _apply_tracking_mode)
+        # ----------------------------------------------------
+        self.target_row = ctk.CTkFrame(root, corner_radius=0)
+        ctk.CTkLabel(self.target_row, text="👤 目標:",
+                     font=(FONT_UI, 12)).pack(side="left", padx=(8, 4))
+        self.lbl_target_hits = ctk.CTkLabel(self.target_row, text="0 筆",
+                                            font=(FONT_UI, 11),
+                                            text_color="#888888")
+        # 先 pack 右側的筆數,按鈕列才能吃掉剩餘寬度
+        self.lbl_target_hits.pack(side="right", padx=(6, 8))
+        # 橫向捲動:對象再多也只占一列高度,不會把下方日誌區擠掉
+        self.target_bar = ctk.CTkScrollableFrame(self.target_row, orientation="horizontal",
+                                                 height=34, corner_radius=0,
+                                                 fg_color="transparent")
+        self.target_bar.pack(side="left", fill="x", expand=True)
 
         # ----------------------------------------------------
         # 0. 頂部狀態列 (快捷按鈕:Discord / 免責聲明 靠左, 設定 靠右)
@@ -760,7 +937,7 @@ class LiveDamageMonitor:
         self.btn_heal_toggle = ctk.CTkButton(
             heal_header,
             text="▼ 治癒事件日誌",
-            font=(FONT_UI, 11, "bold"),
+            font=(FONT_UI, 11),
             fg_color="transparent",
             hover_color="#2a2a2a",
             anchor="w",
@@ -771,7 +948,7 @@ class LiveDamageMonitor:
         self.btn_heal_toggle.pack(side="left", fill="x", expand=True)
 
         self.heal_log_area = ctk.CTkTextbox(self.heal_log_pane, wrap="word",
-                                             font=(FONT_MONO, 13),
+                                             font=(FONT_LOG, 13),
                                              corner_radius=0)
         self.heal_log_area.pack(fill="both", expand=True, padx=6, pady=6)
         # 治療自己 (綠) / 治療他人 (藍) 顏色標籤
@@ -782,15 +959,25 @@ class LiveDamageMonitor:
         self.heal_log_area.configure(state="disabled")
 
         # ----------------------------------------------------
-        # 6. 開發者 LOG (勾選開發者才顯示)
+        # 6. 診斷 LOG 區塊 (視窗最底下,常駐)
         # ----------------------------------------------------
-        self.dev_pane = ctk.CTkFrame(root, corner_radius=0)
-        ctk.CTkLabel(self.dev_pane, text="🛠 開發者 Flag 診斷",
-                     font=(FONT_UI, 11, "bold")).pack(anchor="w", padx=10, pady=(6, 0))
-        self.dev_log_area = ctk.CTkTextbox(self.dev_pane, wrap="word", font=(FONT_MONO, 12),
-                                           corner_radius=0, height=140)
-        self.dev_log_area.pack(fill="both", expand=True, padx=6, pady=6)
-        self.dev_log_area.configure(state="disabled")
+        # 收合狀態只顯示最新一行;點整塊 → 彈出獨立視窗看完整 LOG (診斷單行很長,
+        # 壓在主畫面內看不完)。內容一律存在 self._dev_lines,視窗只是它的檢視器。
+        #
+        # side="bottom" 是關鍵:pack 在中段 pane 之前且靠底邊,
+        # 中段那些 expand=True 的面板 (日誌/排行/治癒) 再怎麼撐都吃不掉這一條。
+        self.dev_pane = None
+        self.dev_log_area = None
+        self.dev_strip = ctk.CTkButton(
+            root, text=DEV_STRIP_EMPTY, font=(FONT_MONO, 11),
+            fg_color="#1a1a1a", hover_color="#2a2a2a", text_color="#888888",
+            anchor="w", corner_radius=6, height=26,
+            command=self._popout_dev,
+        )
+        # 發布版不顯示 (等同舊版隱藏「🛠 開發者」勾選的處置);widget 仍建好,
+        # dev_log 照寫緩衝,只是沒有 UI 入口
+        if not RELEASE_BUILD:
+            self.dev_strip.pack(side="bottom", fill="x", padx=10, pady=(0, 6))
 
         # 監聽視窗 resize,拖動期間跳過技能排行更新,結束後補刷一次
         root.bind("<Configure>", self._on_root_configure)
@@ -803,6 +990,12 @@ class LiveDamageMonitor:
             self._popout_log()
         if self.popout_skill:
             self._popout_skill()
+
+        # 建出初始的目標按鈕列 (此時只有 All);log_pane 已建好,_render_log 可安全呼叫
+        self._refresh_target_options()
+
+        # 每 3 秒依累積傷害重排目標按鈕列
+        self._tick_target_sort()
 
         # 依 track_damage / track_heal 旗標,把 banner + pane 一次性 pack 到位
         self._apply_tracking_mode()
@@ -851,7 +1044,7 @@ class LiveDamageMonitor:
             self.log_pane,
             text=("▶ 即時攻擊事件日誌 (已折疊)" if self.log_collapsed
                   else "▼ 即時攻擊事件日誌"),
-            font=(FONT_UI, 11, "bold"),
+            font=(FONT_UI, 11),
             fg_color="transparent",
             hover_color="#2a2a2a",
             anchor="w",
@@ -860,12 +1053,16 @@ class LiveDamageMonitor:
             command=self.toggle_log_collapse,
         )
         self.btn_log_toggle.pack(fill="x", padx=6, pady=(6, 0))
-        self.log_area = ctk.CTkTextbox(self.log_pane, wrap="word",
-                                        font=(FONT_MONO, 13), corner_radius=0)
+        # wrap="none":單筆過長就往右凸出去,不折行。CTkTextbox 的水平捲軸會在
+        # 需要時自動出現 (它每 200ms 檢查 xview),不必自己管。
+        self.log_area = ctk.CTkTextbox(self.log_pane, wrap="none",
+                                        font=(FONT_LOG, 13), corner_radius=0)
         # 折疊狀態下不 pack log_area,由 toggle_log_collapse 處理
         if not self.log_collapsed:
             self.log_area.pack(fill="both", expand=True, padx=6, pady=6)
         self.log_area._textbox.tag_config("highlight", foreground="#ff4d4d")
+        # 角色 ID 狀態列:取得後綠字 (未取得走 highlight 紅字)
+        self.log_area._textbox.tag_config("ident_ok", foreground="#4dd471")
         self.log_area._textbox.configure(tabs=self._scaled_tab_stops())
         self.log_area.configure(state="disabled")
         return self.log_pane
@@ -882,7 +1079,7 @@ class LiveDamageMonitor:
             skill_header,
             text=("▶ 技能傷害排行 (已折疊)" if self.skill_collapsed
                   else "▼ 技能傷害排行"),
-            font=(FONT_UI, 11, "bold"),
+            font=(FONT_UI, 11),
             fg_color="transparent",
             hover_color="#2a2a2a",
             anchor="w",
@@ -913,26 +1110,13 @@ class LiveDamageMonitor:
     # ================================================
     # Popout / dock:攻擊日誌 & 技能排行的獨立視窗切換
     # ================================================
-    def _dump_log_content(self):
-        """撈出 log_area 的純文字內容 (tags 不會保留)。"""
-        self.log_area.configure(state="normal")
-        s = self.log_area.get("1.0", "end-1c")
-        self.log_area.configure(state="disabled")
-        return s
-
-    def _restore_log_content(self, s):
-        if not s:
-            return
-        self.log_area.configure(state="normal")
-        self.log_area.insert("1.0", s)
-        self.log_area.see("end")
-        self.log_area.configure(state="disabled")
-
     def _popout_log(self):
-        """把 log_pane 從 root 移到獨立 CTkToplevel。"""
+        """把 log_pane 從 root 移到獨立 CTkToplevel。
+        內容不搬 widget 文字,改由 _render_log() 依 log_entries 重畫 —— 這樣
+        紅字高亮與目標篩選都會正確重建。
+        """
         if self._log_popout_win is not None:
             return
-        old_content = self._dump_log_content()
         if hasattr(self, "log_pane") and self.log_pane:
             self.log_pane.destroy()
         win = ctk.CTkToplevel(self.root)
@@ -943,13 +1127,12 @@ class LiveDamageMonitor:
         self._log_popout_win = win
         self._build_log_pane(win)
         self.log_pane.pack(fill="both", expand=True, padx=6, pady=6)
-        self._restore_log_content(old_content)
+        self._render_log()
         # 主視窗如果目前是置頂,新開的 popout 也要一起置頂
         self._apply_topmost_all()
 
     def _dock_log(self):
         """把 log_pane 從 Toplevel 收回 root。"""
-        old_content = self._dump_log_content() if hasattr(self, "log_area") else ""
         if hasattr(self, "log_pane") and self.log_pane:
             self.log_pane.destroy()
         if self._log_popout_win is not None:
@@ -959,7 +1142,7 @@ class LiveDamageMonitor:
                 pass
             self._log_popout_win = None
         self._build_log_pane(self.root)
-        self._restore_log_content(old_content)
+        self._render_log()
 
     def _popout_skill(self):
         """把 skill_pane 從 root 移到獨立 CTkToplevel。
@@ -994,6 +1177,57 @@ class LiveDamageMonitor:
         self._build_skill_pane(self.root)
         self.update_skill_ranking()
 
+    def _build_dev_pane(self, parent):
+        """建立診斷 LOG 面板 (只會被 _popout_dev 呼叫,parent 恆為 Toplevel)。"""
+        self.dev_pane = ctk.CTkFrame(parent, corner_radius=0)
+        ctk.CTkLabel(self.dev_pane, text="🛠 診斷 LOG",
+                     font=(FONT_UI, 11)).pack(anchor="w", padx=10, pady=(6, 0))
+        # 診斷行很長 (flags 7 bytes + 技能 + DoT + 候選),用 none 不折行,靠橫向捲軸看完整
+        self.dev_log_area = ctk.CTkTextbox(self.dev_pane, wrap="none", font=(FONT_MONO, 12),
+                                           corner_radius=0)
+        self.dev_log_area.pack(fill="both", expand=True, padx=6, pady=6)
+        self.dev_log_area.configure(state="disabled")
+
+    def _popout_dev(self):
+        """點底部區塊 → 彈出完整診斷 LOG 視窗 (內容取自 _dev_lines)。
+        已經開著就把它提到最前面,不重複開窗。
+        """
+        if self._dev_popout_win is not None:
+            try:
+                self._dev_popout_win.deiconify()
+                self._dev_popout_win.lift()
+                self._dev_popout_win.focus_force()
+            except Exception:
+                pass
+            return
+        win = ctk.CTkToplevel(self.root)
+        win.title("MM Scribe — 診斷 LOG")
+        # 單行長度約 110 字元,預設開寬一點免得還要手動拉
+        win.geometry("820x420")
+        win.minsize(400, 200)
+        win.protocol("WM_DELETE_WINDOW", lambda: self._on_popout_closed("dev"))
+        self._dev_popout_win = win
+        self._build_dev_pane(win)
+        self.dev_pane.pack(fill="both", expand=True, padx=6, pady=6)
+        if self._dev_lines:
+            self.dev_log_area.configure(state="normal")
+            self.dev_log_area.insert("1.0", "\n".join(self._dev_lines) + "\n")
+            self.dev_log_area.see("end")
+            self.dev_log_area.configure(state="disabled")
+        # 主視窗如果目前是置頂,新開的 popout 也要一起置頂
+        self._apply_topmost_all()
+
+    def _close_dev_popout(self):
+        """關閉診斷視窗。內容在 _dev_lines 裡,重開時原樣還原。"""
+        if self._dev_popout_win is not None:
+            try:
+                self._dev_popout_win.destroy()
+            except Exception:
+                pass
+            self._dev_popout_win = None
+        self.dev_pane = None
+        self.dev_log_area = None
+
     def _on_popout_closed(self, kind):
         """使用者點 Toplevel 的 X → 對應 checkbox 取消勾選 → dock 回主視窗。
         dock 回來會增加主視窗高度,和 checkbox 走同一條 delta 調整。
@@ -1014,6 +1248,9 @@ class LiveDamageMonitor:
             self._dock_skill()
             self._adjust_root_height_delta(+self._POPOUT_HEIGHT_ESTIMATE)
             self._apply_tracking_mode()
+        elif kind == "dev":
+            # 診斷視窗沒有 dock 回主畫面的形態 — 關掉就好,底部區塊照常收訊息
+            self._close_dev_popout()
 
     # popout 出去時主視窗少一區,縮短高度;dock 回來時補回高度。
     # 200px 是「一個中段 pane 的合理視覺占比」估值,scale 會乘上去。
@@ -1066,9 +1303,9 @@ class LiveDamageMonitor:
         """依 self.track_damage / self.track_heal 重新佈局所有可切換的 banner / pane。
         - status_bar 位於視窗最上方 (side=top),不可被壓縮
         - Banner (dmg_banner, heal_banner) 用 `before=ctrl_row1` 插入到控制列上方
-        - 中段 pane (log_pane, skill_pane, heal_log_pane, dev_pane) 全部 forget 後
+        - 中段 pane (log_pane, skill_pane, heal_log_pane) 全部 forget 後
           按順序 pack 於末端 (list 尾端 = 視覺上位於控制列下方)
-        - dev_pane 一律 pack 在最後,讓開發者面板始終位於中段的最下方
+        - 底部診斷區塊不在此處理:它 side="bottom" 常駐,不隨追蹤模式變動
         """
         # === Banners ===
         self.dmg_banner.pack_forget()
@@ -1084,23 +1321,24 @@ class LiveDamageMonitor:
         # === 中段 panes ===
         # popout 中的 pane 已 pack 在自己的 Toplevel,主視窗這邊要跳過 (不能對它
         # 呼叫 pack_forget,因為 Toplevel 的 pack 不是 root 管的)
+        self.target_row.pack_forget()
         if not self.popout_log:
             self.log_pane.pack_forget()
         if not self.popout_skill:
             self.skill_pane.pack_forget()
         self.heal_log_pane.pack_forget()
-        if getattr(self, "is_dev_mode", False):
-            self.dev_pane.pack_forget()
 
         if self.track_damage:
+            # 目標篩選同時作用於看板/技能排行/日誌,只要有追蹤傷害就顯示,
+            # 不受 popout_log 影響
+            self.target_row.pack(fill="x", padx=10, pady=(0, 3))
             if not self.popout_log:
                 self.log_pane.pack(fill="both", expand=True, padx=10, pady=(3, 3))
             if not self.popout_skill:
                 self.skill_pane.pack(fill="both", expand=True, padx=10, pady=(0, 3))
         if self.track_heal:
             self.heal_log_pane.pack(fill="both", expand=True, padx=10, pady=(0, 3))
-        if getattr(self, "is_dev_mode", False):
-            self.dev_pane.pack(fill="both", expand=False, padx=10, pady=(0, 6))
+        # 底部診斷區塊不參與這裡的重排 (side="bottom",__init__ 內一次 pack 到底)
 
         # 依當前佈局重算 minsize,確保 status_bar 不會被 log/skill/heal 這些
         # expand=True 的面板擠掉。用 after(0) 讓 Tk 完成本次 pack 再量高度
@@ -1108,20 +1346,26 @@ class LiveDamageMonitor:
 
     def _refresh_minsize(self):
         """依「當前顯示的 banner + 3 條控制列 + status_bar」總高度,
-        算出最小視窗高度並套用到 wm_minsize。
-        - winfo_reqheight 回傳實際像素 (含 CTk scaling),故不用再乘 font_scale
-        - 用 wm_minsize 而非 CTk 的 minsize 以避免二次縮放
+        算出最小視窗高度並套用。
+        - winfo_reqheight 回傳實際像素 (含 CTk scaling),要除回 font_scale 變成邏輯像素
+        - **必須走 CTk 的 minsize()**,不能用 wm_minsize:CTk 會記住 minsize() 給的值,
+          在之後的 scaling / Configure 事件把它重新套一次,直接寫 wm_minsize 會被蓋掉
+          (實測:啟動後查到的仍是 __init__ 裡那組 400x180)
         """
         self.root.update_idletasks()
         parts = [self.ctrl_row1, self.ctrl_row2, self.ctrl_row3, self.status_bar]
+        # 底部診斷區塊是常駐的 (發布版除外),最小高度要把它算進去
+        if self.dev_strip.winfo_manager():
+            parts.append(self.dev_strip)
         if self.track_damage:
             parts.append(self.dmg_banner)
+            parts.append(self.target_row)
         if self.track_heal:
             parts.append(self.heal_banner)
         req_h = sum(w.winfo_reqheight() for w in parts)
         # 再留 80px 給日誌區最小可視高度 + padding,不然 status_bar 剛好貼滿反而擠日誌
-        min_h = req_h + 80
-        self.root.wm_minsize(400, int(min_h))
+        min_h = (req_h + 80) / max(self.font_scale, 0.1)
+        self.root.minsize(400, int(min_h))
 
     def _on_track_damage_change(self):
         self.track_damage = self.track_damage_var.get()
@@ -1168,11 +1412,11 @@ class LiveDamageMonitor:
         header = ctk.CTkFrame(overlay, fg_color="transparent", height=44)
         header.pack(fill="x", padx=12, pady=(12, 0))
         ctk.CTkLabel(header, text="🌐 網路環境檢測",
-                     font=(FONT_UI, 16, "bold"),
+                     font=(FONT_UI, 16),
                      text_color="#4dccff").pack(side="left", padx=6)
         ctk.CTkButton(header, text="✕", width=32, height=32, corner_radius=16,
                       fg_color="#3a3a3a", hover_color="#c94a4a",
-                      font=(FONT_MONO, 14, "bold"),
+                      font=(FONT_LOG, 14),
                       command=self.hide_network_check).pack(side="right", padx=6)
         ctk.CTkButton(header, text="🔄 重新檢測", width=100, height=32,
                       corner_radius=8,
@@ -1185,7 +1429,7 @@ class LiveDamageMonitor:
 
         # 結果顯示區
         self._netcheck_result = ctk.CTkTextbox(overlay, wrap="word",
-                                                font=(FONT_MONO, 11),
+                                                font=(FONT_LOG, 11),
                                                 corner_radius=0,
                                                 fg_color="#1a1a1a")
         self._netcheck_result.pack(fill="both", expand=True, padx=16, pady=12)
@@ -1198,7 +1442,7 @@ class LiveDamageMonitor:
         self._netcheck_result._textbox.tag_config("tag_active", foreground="#66ffa0")
         self._netcheck_result._textbox.tag_config("tag_header",
                                                    foreground="#ffffff",
-                                                   font=(FONT_UI, 12, "bold"))
+                                                   font=(FONT_UI, 12))
 
         self._run_network_checks()
 
@@ -1313,10 +1557,11 @@ class LiveDamageMonitor:
 
     def _apply_chosen_iface(self, iface_dict):
         """把掃描結果套用到 self.chosen_iface,之後 sniff() 就會綁這張卡。"""
-        if iface_dict is None:
-            self.chosen_iface = None
-            return
-        self.chosen_iface = iface_dict.get("name")
+        prev = self.chosen_iface
+        self.chosen_iface = None if iface_dict is None else iface_dict.get("name")
+        # 攔截執行緒是常駐的 (見 _ensure_sniffer),換卡要重開一條才會綁到新的
+        if self.chosen_iface != prev:
+            self._ensure_sniffer(restart=True)
 
     # ================================================
     # macOS: BPF 權限引導
@@ -1358,7 +1603,7 @@ class LiveDamageMonitor:
         self._bpf_dialog = win
 
         ctk.CTkLabel(win, text="需要封包擷取權限",
-                     font=(FONT_UI, 16, "bold")).pack(pady=(18, 6))
+                     font=(FONT_UI, 16)).pack(pady=(18, 6))
 
         body = (
             "MM Scribe 需要讀取網路封包才能統計傷害,但 macOS 預設只允許\n"
@@ -1387,7 +1632,7 @@ class LiveDamageMonitor:
         script = self._bpf_helper_script_path()
         self._bpf_setup_btn = ctk.CTkButton(
             btn_row, text="設定 (需要輸入密碼)", width=190,
-            font=(FONT_UI, 12, "bold"), command=self._run_bpf_setup)
+            font=(FONT_UI, 12), command=self._run_bpf_setup)
         self._bpf_setup_btn.pack(side="left", padx=6)
         if script is None:
             # 找不到腳本就別給一個按了會失敗的按鈕
@@ -1477,6 +1722,11 @@ class LiveDamageMonitor:
         結果會設到 self.chosen_iface,後續按「開始」時 sniff 會用這張卡。
         """
         self.log("=== 自動偵測收包網卡中... (背景執行,可正常操作) ===")
+        # 角色身分偵測不等「開始」— 先用 scapy 預設卡把攔截跑起來,
+        # 偵測完成後 _apply_chosen_iface 會重開一條綁到選定的網卡
+        self._ensure_sniffer()
+        self._ident_status_line()
+        self.dev_log_startup_hints()
 
         def on_progress(status, title, *details):
             # 僅把有意義的訊息推到主日誌 (略過每張介面的細節,避免刷屏)
@@ -1714,11 +1964,11 @@ class LiveDamageMonitor:
         header = ctk.CTkFrame(overlay, fg_color="transparent", height=44)
         header.pack(fill="x", padx=12, pady=(12, 0))
         ctk.CTkLabel(header, text="⚠ 免責聲明",
-                     font=(FONT_UI, 16, "bold"),
+                     font=(FONT_UI, 16),
                      text_color="#ff9944").pack(side="left", padx=6)
         ctk.CTkButton(header, text="✕", width=32, height=32, corner_radius=16,
                       fg_color="#3a3a3a", hover_color="#c94a4a",
-                      font=(FONT_MONO, 14, "bold"),
+                      font=(FONT_LOG, 14),
                       command=self.hide_disclaimer).pack(side="right", padx=6)
 
         # 內文區
@@ -1753,8 +2003,24 @@ class LiveDamageMonitor:
 
     # ---- 設定畫面 ----
     def _scaled_tab_stops(self):
-        """LOG_TAB_STOPS 是像素位置,字體縮放時同步放大以維持欄位對齊。"""
-        return tuple(str(int(int(x) * self.font_scale)) for x in LOG_TAB_STOPS)
+        """依實際字體量測算出三個欄位停靠點,再乘 font_scale 換成像素。
+        量測固定在基準字級做 — CTk 的字體也是乘同一個 font_scale,兩者等比。
+
+        第一個停靠點帶 "right":傷害欄靠它右對齊,不靠空白補齊,
+        所以 FONT_LOG 是不是等寬字都無所謂 (微軟正黑體的空白只有數字的一半寬,
+        用補空白的舊做法會歪掉)。
+        """
+        if self._log_font is None:
+            self._log_font = tkfont.Font(family=FONT_LOG, size=13)
+        measure = self._log_font.measure
+        # 傷害欄:右緣落在 LOG_DMG_WIDTH 個數字寬的位置
+        stop0 = measure("9" * LOG_DMG_WIDTH)
+        # 標籤欄:貼著傷害欄右緣,只留 LOG_DMG_GAP
+        stop1 = stop0 + LOG_DMG_GAP
+        # 技能名欄:仍以傷害取樣字串為基準,不受上面縮排影響 (位置固定)
+        stop2 = measure(LOG_DMG_SAMPLE) + measure(LOG_TAG_SAMPLE) + LOG_COL_GAP * 2
+        px = [str(int(v * self.font_scale)) for v in (stop0, stop1, stop2)]
+        return (px[0], "right", px[1], "left", px[2], "left")
 
     def show_settings(self):
         """建立覆蓋整個視窗的設定畫面。已顯示時不重複建立。"""
@@ -1768,11 +2034,11 @@ class LiveDamageMonitor:
         header = ctk.CTkFrame(overlay, fg_color="transparent", height=44)
         header.pack(fill="x", padx=12, pady=(12, 0))
         ctk.CTkLabel(header, text="⚙ 設定",
-                     font=(FONT_UI, 16, "bold"),
+                     font=(FONT_UI, 16),
                      text_color="#88ccff").pack(side="left", padx=6)
         ctk.CTkButton(header, text="✕", width=32, height=32, corner_radius=16,
                       fg_color="#3a3a3a", hover_color="#c94a4a",
-                      font=(FONT_MONO, 14, "bold"),
+                      font=(FONT_LOG, 14),
                       command=self.hide_settings).pack(side="right", padx=6)
 
         # 用 ScrollableFrame,視窗過矮時內容自動可捲 (原本用 CTkFrame 會被截掉)
@@ -1783,7 +2049,7 @@ class LiveDamageMonitor:
         section = ctk.CTkFrame(body, fg_color="transparent")
         section.pack(fill="x", padx=12, pady=(12, 4))
         ctk.CTkLabel(section, text="── 顯示 ──",
-                     font=(FONT_UI, 12, "bold"),
+                     font=(FONT_UI, 12),
                      text_color="#ffffff", anchor="w").pack(fill="x", pady=(0, 8))
 
         # 字體縮放列
@@ -1796,7 +2062,7 @@ class LiveDamageMonitor:
         # 每次 ▲ / ▼ 步進 0.1,夾在 FONT_SCALE_MIN ~ FONT_SCALE_MAX 之間
         self._scale_entry = ctk.CTkEntry(
             scale_row, width=64, justify="center",
-            font=(FONT_MONO, 13, "bold"), corner_radius=6,
+            font=(FONT_LOG, 13), corner_radius=6,
         )
         self._scale_entry.insert(0, f"{self.font_scale:.1f}x")
         self._scale_entry.configure(state="readonly")
@@ -1807,13 +2073,13 @@ class LiveDamageMonitor:
         ctk.CTkButton(
             step_col, text="▲", width=22, height=14, corner_radius=3,
             fg_color="#4a4a4a", hover_color="#6a6a6a",
-            font=(FONT_MONO, 9),
+            font=(FONT_LOG, 9),
             command=lambda: self._step_scale(0.1),
         ).pack(pady=(0, 1))
         ctk.CTkButton(
             step_col, text="▼", width=22, height=14, corner_radius=3,
             fg_color="#4a4a4a", hover_color="#6a6a6a",
-            font=(FONT_MONO, 9),
+            font=(FONT_LOG, 9),
             command=lambda: self._step_scale(-0.1),
         ).pack()
 
@@ -1859,7 +2125,7 @@ class LiveDamageMonitor:
         track_section = ctk.CTkFrame(body, fg_color="transparent")
         track_section.pack(fill="x", padx=12, pady=(16, 4))
         ctk.CTkLabel(track_section, text="── 追蹤 ──",
-                     font=(FONT_UI, 12, "bold"),
+                     font=(FONT_UI, 12),
                      text_color="#ffffff", anchor="w").pack(fill="x", pady=(0, 8))
 
         ctk.CTkCheckBox(
@@ -1881,15 +2147,17 @@ class LiveDamageMonitor:
         ).pack(anchor="w", pady=4)
 
         ctk.CTkLabel(track_section,
-                     text="※ 兩者可同時勾選;至少留一個開啟以免主畫面空白",
+                     text="※ 攻擊數值/治癒數值可同時勾選;至少留一個開啟以免主畫面空白\n"
+                          "※ 攻擊數值只統計「攻擊者 = 自己」的傷害,寵物/隊友/敵人不計入;\n"
+                          "　 尚未偵測到角色 ID 時一律不記錄,可用控制列的「強制偵測」暫時全收",
                      font=(FONT_UI, 10),
-                     text_color="#888888", anchor="w").pack(fill="x", pady=(8, 0))
+                     text_color="#888888", anchor="w", justify="left").pack(fill="x", pady=(8, 0))
 
         # ── 「診斷」區塊 ──
         diag_section = ctk.CTkFrame(body, fg_color="transparent")
         diag_section.pack(fill="x", padx=12, pady=(16, 4))
         ctk.CTkLabel(diag_section, text="── 診斷 ──",
-                     font=(FONT_UI, 12, "bold"),
+                     font=(FONT_UI, 12),
                      text_color="#ffffff", anchor="w").pack(fill="x", pady=(0, 8))
 
         diag_row = ctk.CTkFrame(diag_section, fg_color="transparent")
@@ -1951,15 +2219,79 @@ class LiveDamageMonitor:
         status = "已開啟" if self.is_topmost else "已關閉"
         self.log(f"=== 視窗置頂 {status} ===")
 
+    def toggle_force_all(self):
+        """強制偵測:無視角色 ID 門檻,所有解析到的傷害全部計入統計。
+
+        角色 ID 偵測失敗時 (換場景沒收到自己的登場訊息、串流被重傳打斷、沒裝 brotli)
+        統計會整個停擺,這個勾選是逃生門。代價是隊友/寵物/敵人的傷害也會一起算進來。
+        兩種口徑不該混在同一份統計裡,所以切換時直接歸零重來。
+        """
+        self.force_all = self.force_all_var.get()
+        self.clear_data()
+        if self.force_all:
+            self.log_error("=== ⚡ 強制偵測 已開啟 — 所有人的傷害都會計入,"
+                           "數據不再只屬於自己 ===")
+        else:
+            self.log("=== 強制偵測 已關閉 — 恢復成只統計自己的傷害 ===")
+
+    def _bind_tooltip(self, widget, text):
+        """滑鼠停在 widget 上 TOOLTIP_DELAY_MS 後跳出小提示,移開即消失。"""
+        widget.bind("<Enter>", lambda _e: self._tooltip_schedule(widget, text))
+        widget.bind("<Leave>", lambda _e: self._tooltip_hide())
+        widget.bind("<Button-1>", lambda _e: self._tooltip_hide())
+
+    def _tooltip_schedule(self, widget, text):
+        self._tooltip_hide()
+        self._tooltip_after_id = self.root.after(
+            TOOLTIP_DELAY_MS, lambda: self._tooltip_show(widget, text))
+
+    def _tooltip_show(self, widget, text):
+        """提示視窗:overrideredirect 的 Toplevel,永遠置頂。
+        它是短命視窗,不納入 _apply_topmost_all 的清單 (主視窗置頂時也不能被蓋掉)。
+        任何例外都吞掉 — 提示壞了不能影響主功能。
+        """
+        self._tooltip_after_id = None
+        try:
+            win = tk.Toplevel(self.root)
+            win.overrideredirect(True)
+            win.attributes("-topmost", True)
+            ctk.CTkLabel(win, text=text, font=(FONT_UI, 11),
+                         fg_color="#2b2b2b", text_color="#dddddd",
+                         justify="left", anchor="w", wraplength=360,
+                         corner_radius=6).pack(padx=1, pady=1)
+            win.update_idletasks()
+            # 以 widget 為中心置中,再夾回螢幕內 —— ? 鈕靠右時直接置中會有一半跑出畫面
+            tip_w = win.winfo_width()
+            x = widget.winfo_rootx() + widget.winfo_width() // 2 - tip_w // 2
+            x = max(0, min(x, self.root.winfo_screenwidth() - tip_w))
+            win.geometry(f"+{x}+{widget.winfo_rooty() + widget.winfo_height() + 4}")
+            self._tooltip_win = win
+        except Exception:
+            self._tooltip_win = None
+
+    def _tooltip_hide(self):
+        if self._tooltip_after_id is not None:
+            try:
+                self.root.after_cancel(self._tooltip_after_id)
+            except Exception:
+                pass
+            self._tooltip_after_id = None
+        if self._tooltip_win is not None:
+            try:
+                self._tooltip_win.destroy()
+            except Exception:
+                pass
+            self._tooltip_win = None
+
     def _apply_topmost_all(self):
         """對主視窗與所有 popout Toplevel 一併套用 topmost 狀態。
-        呼叫時機:toggle_topmost / _popout_log / _popout_skill (新視窗建立時)。
+        呼叫時機:toggle_topmost / _popout_log / _popout_skill / _popout_dev (新視窗建立時)。
         """
         try:
             self.root.attributes("-topmost", self.is_topmost)
         except Exception:
             pass
-        for w in (self._log_popout_win, self._skill_popout_win):
+        for w in (self._log_popout_win, self._skill_popout_win, self._dev_popout_win):
             if w is None:
                 continue
             try:
@@ -2000,7 +2332,7 @@ class LiveDamageMonitor:
             target.geometry(f"{int(w / scale)}x{int(h / scale)}")
 
     def toggle_skill_collapse(self):
-        """折疊/展開技能傷害排行區塊。折疊時 skill_scroll 隱藏但 self.skill_damage 持續累計。"""
+        """折疊/展開技能傷害排行區塊。折疊時 skill_scroll 隱藏但 target_stats 持續累計。"""
         if self.skill_collapsed:
             self.skill_scroll.pack(fill="both", expand=True, padx=6, pady=6)
             self.skill_pane.pack_configure(expand=True, fill="both")
@@ -2093,9 +2425,9 @@ class LiveDamageMonitor:
                                      text="", anchor="e",
                                      font=value_font, fill="#ffffff")
 
-        # 詳細統計:字體與技能列 name 相同 (12pt bold),展開時才 pack
+        # 詳細統計:字體與技能列 name 相同 (12pt),展開時才 pack
         detail_lbl = ctk.CTkLabel(container, text="", anchor="w",
-                                   font=(FONT_UI, 12, "bold"),
+                                   font=(FONT_UI, 12),
                                    text_color="#88ccff")
 
         row = {
@@ -2150,7 +2482,7 @@ class LiveDamageMonitor:
             c.coords(row["fill_id"], 0, 0, int(w * row["pct"]), canvas_h)
 
     def update_skill_ranking(self):
-        """把 self.skill_damage (raw by skill_id) 聚合後重排技能列。
+        """把「目前選取目標」的 skill_damage (raw by skill_id) 聚合後重排技能列。
         聚合分兩層:
           A) 依 format_skill_name(sid) 得到的顯示名稱聚合 —— 永遠生效,
              處理同一招在遊戲內產生多個 skill_id 但名稱相同的雜訊。
@@ -2159,7 +2491,8 @@ class LiveDamageMonitor:
         """
         if self._is_resizing:
             return
-        if not self.skill_damage:
+        view = self._view()
+        if not view["skill_damage"]:
             # row 的 top-level widget 是 "container" (改 Canvas 版時從 "frame" 改名),
             # 忘了同步這裡的 destroy → 清除後首次進這分支會 KeyError,
             # 導致 clear_data 中斷、下次 start_monitoring 也在 update_skill_ranking 掛掉
@@ -2171,7 +2504,7 @@ class LiveDamageMonitor:
         merge = self.merge_var.get()
         agg = {}       # display_name → damage
         agg_ids = {}   # display_name → [skill_id, ...] (供詳細統計聚合)
-        for sid, dmg in self.skill_damage.items():
+        for sid, dmg in view["skill_damage"].items():
             name = format_skill_name(sid)
             if merge:
                 name = MERGE_GROUPS.get(name, name)
@@ -2234,81 +2567,276 @@ class LiveDamageMonitor:
         """把多個 skill_id 的命中次數與各標籤次數合計,格式化為顯示字串。
         沒有命中資料時回傳「(無資料)」。
         """
+        view = self._view()
         hits = 0
-        counts = {"爆擊": 0, "強擊": 0, "連擊": 0}
+        counts = {name: 0 for name in COVERAGE_TAGS}
         for sid in sids:
-            hits += self.skill_hits.get(sid, 0)
-            per = self.skill_tag_counts.get(sid, {})
+            hits += view["skill_hits"].get(sid, 0)
+            per = view["skill_tags"].get(sid, {})
             for tag_name in counts:
                 counts[tag_name] += per.get(tag_name, 0)
         if hits == 0:
             return "  (無資料)"
-        parts = [f"強擊率 {counts['強擊'] * 100 / hits:.1f}%",
-                 f"連擊率 {counts['連擊'] * 100 / hits:.1f}%",
-                 f"爆擊率 {counts['爆擊'] * 100 / hits:.1f}%"]
+        # 顯示順序沿用既有的 強擊 → 連擊 → 爆擊,新標籤接在後面
+        order = ("強擊", "連擊", "爆擊") + tuple(
+            n for n in COVERAGE_TAGS if n not in ("強擊", "連擊", "爆擊"))
+        parts = [f"{name}率 {counts[name] * 100 / hits:.1f}%" for name in order]
         return "  " + "  |  ".join(parts) + f"    (共 {hits} 次)"
 
-    def toggle_dev_mode(self):
-        """delegate 到 _apply_tracking_mode,讓 dev_pane 與治癒/傷害面板一起重新排序。
-        (若只在這裡 pack,dev_pane 會插在 heal_log_pane 之前,順序不對)
+    def dev_log_startup_hints(self):
+        """啟動時先把環境狀況寫進診斷 LOG,底部區塊一開始就有東西可看。"""
+        if _BROTLI is None:
+            self.dev_log("⚠ 未安裝 brotli,enc=1 的封包只看得到壓縮位元組 "
+                         "(pip install brotli),角色 ID 偵測也會失效")
+        if self.ident_self is None:
+            self.dev_log("[ID] 尚未取得自己的身分 — 等 0x4FFF「我的角色資料」出現"
+                         "(換地圖時會送)")
+        else:
+            acc, idx = self.ident_self
+            bound = ("0x%08X" % self.ident_self_entity
+                     if self.ident_self_entity is not None else "未綁定")
+            self.dev_log(f"[ID] 目前身分: 帳號碼={acc} 角色索引={idx} | 自己 = {bound}")
+
+    # ================================================
+    # 攻擊事件日誌
+    #   所有寫入都先進 log_entries (deque),再視「目前選取的目標」決定要不要
+    #   畫到 log_area。切換目標時用 _render_log() 依緩衝重畫整份。
+    # ================================================
+    def _log_visible(self, entry):
+        """系統訊息 (target=None) 永遠顯示;傷害事件只在 All 或該目標被選取時顯示。"""
+        return (entry["target"] is None
+                or self.selected_target == TARGET_ALL
+                or entry["target"] == self.selected_target)
+
+    def _insert_log_line(self, entry):
+        """把單筆 entry 寫進 log_area。
+        紅字判定放在這裡即時算 (而非存進 entry),這樣切換高亮標籤後重畫,
+        舊事件也會依新的高亮設定重新上色。
         """
-        self.is_dev_mode = self.dev_var.get()
-        self._apply_tracking_mode()
+        highlight = self.highlight_var.get()
+        red = entry["error"] or (highlight != "無" and highlight in entry["tags"])
+        tag = "highlight" if red else entry.get("color")
+        self.log_area.configure(state="normal")
+        if tag:
+            self.log_area._textbox.insert("end", entry["text"] + "\n", tag)
+        else:
+            self.log_area.insert("end", entry["text"] + "\n")
+        # 只捲垂直:wrap="none" 下 see() 會連帶水平捲到行尾,把傷害值欄推出視野
+        self.log_area._textbox.yview_moveto(1.0)
+        self.log_area.configure(state="disabled")
+
+    def _append_log(self, text, target=None, tags=(), error=False, color=None):
+        """新事件的快速路徑:進緩衝,看得到才畫 (不重畫整份)。
+        color = 額外的文字色 tag (目前只有 ident_ok);紅字優先權高於它。
+        """
+        entry = {"text": text, "target": target, "tags": tags,
+                 "error": error, "color": color}
+        self.log_entries.append(entry)
+        if self._log_visible(entry):
+            self._insert_log_line(entry)
+
+    def _render_log(self):
+        """清空 log_area 後依 log_entries 重畫 (只畫目前目標看得到的)。
+        呼叫時機:切換目標 / 切換高亮 / 清除資料 / log_pane popout-dock 重建。
+
+        重畫走批次路徑:整份文字一次 insert 進底層 tk.Text,紅字事後用行號
+        tag_add 補上,state 切換與捲動各只做一次。逐行呼叫 CTkTextbox.insert()
+        會每次觸發捲軸需求檢查 (yview 計算 + grid 調整),數百筆就會卡到約一秒。
+        """
+        highlight = self.highlight_var.get()
+        lines = []
+        tagged_rows = []          # [(行號, tag)];tk.Text 行號從 1 起算
+        for entry in self.log_entries:
+            if not self._log_visible(entry):
+                continue
+            lines.append(entry["text"])
+            if entry["error"] or (highlight != "無" and highlight in entry["tags"]):
+                tagged_rows.append((len(lines), "highlight"))
+            elif entry.get("color"):
+                tagged_rows.append((len(lines), entry["color"]))
+        tb = self.log_area._textbox
+        tb.configure(state="normal")
+        tb.delete("1.0", "end")
+        if lines:
+            tb.insert("1.0", "\n".join(lines) + "\n")
+            for row, tag in tagged_rows:
+                tb.tag_add(tag, f"{row}.0", f"{row + 1}.0")
+        tb.configure(state="disabled")
+        # 只捲垂直,理由同 _insert_log_line
+        tb.yview_moveto(1.0)
 
     def log(self, text):
-        self.log_area.configure(state="normal")
-        self.log_area.insert("end", text + "\n")
-        self.log_area.see("end")
-        self.log_area.configure(state="disabled")
+        """系統訊息:不屬於任何目標,任何篩選下都會顯示。"""
+        self._append_log(text)
 
     def log_error(self, text):
         """紅字錯誤訊息(共用 highlight tag)。"""
-        self.log_area.configure(state="normal")
-        self.log_area._textbox.insert("end", text + "\n", "highlight")
-        self.log_area.see("end")
-        self.log_area.configure(state="disabled")
+        self._append_log(text, error=True)
 
-    def log_damage(self, text, tags):
-        """依選定的高亮標籤決定是否套用紅字樣式。"""
-        self.log_area.configure(state="normal")
-        highlight = self.highlight_var.get()
-        if highlight != "無" and highlight in tags:
-            self.log_area._textbox.insert("end", text + "\n", "highlight")
-        else:
-            self.log_area.insert("end", text + "\n")
-        self.log_area.see("end")
-        self.log_area.configure(state="disabled")
+    def log_damage(self, text, tags, target_id):
+        """攻擊事件:記下受擊目標,供切換目標時過濾。"""
+        self._append_log(text, target=target_id, tags=tags)
+
 
     def dev_log(self, text):
+        """診斷訊息:進緩衝 → 更新底部單行 → 展開視窗開著就一併寫入。"""
+        self._dev_lines.append(text)
+        # 底部只有一行,換行字元會把 button 撐高,長行也要截斷
+        line = text.replace("\n", " ")
+        if len(line) > DEV_STRIP_MAX_CHARS:
+            line = line[:DEV_STRIP_MAX_CHARS - 1] + "…"
+        try:
+            self.dev_strip.configure(text=line)
+        except Exception:
+            pass
+        # 視窗關閉時 widget 不存在 (寫入是 after() 排程,可能晚於關窗)
+        if self.dev_log_area is None:
+            return
         self.dev_log_area.configure(state="normal")
         self.dev_log_area.insert("end", text + "\n")
         self.dev_log_area.see("end")
         self.dev_log_area.configure(state="disabled")
 
+    # ================================================
+    # 依攻擊對象分桶的統計
+    # ================================================
+    @staticmethod
+    def _new_stat_bucket():
+        """單一攻擊對象 (或 TARGET_ALL) 的統計容器。
+        欄位語意與舊版的 self.total_damage / tag_counts / skill_* 一一對應。
+        """
+        return {
+            "damage": 0,                                  # 累積傷害
+            "hits": 0,                                    # 命中筆數 (覆蓋率分母)
+            "tags": {name: 0 for name in COVERAGE_TAGS},  # 各標籤出現次數
+            "skill_damage": {},                           # skill_id → 傷害
+            "skill_hits": {},                             # skill_id → 命中次數
+            "skill_tags": {},                             # skill_id → {tag: 次數}
+            "first": None,                                # 首筆時間 (DPS 用)
+            "last": None,                                 # 末筆時間
+        }
+
+    def _bucket(self, key):
+        """取得指定 key 的統計桶,不存在則建立。"""
+        b = self.target_stats.get(key)
+        if b is None:
+            b = self.target_stats[key] = self._new_stat_bucket()
+        return b
+
+    def _view(self):
+        """目前畫面應該顯示的統計桶 (依下拉選單選取的目標)。"""
+        return self._bucket(self.selected_target)
+
+    def _register_target(self, target_id):
+        """記錄新出現的攻擊對象並刷新下拉選單。已知對象則不動作。
+        判重靠 target_stats:parse_payload 是「先 _register_target 再建桶」,
+        所以首次出現時這裡還查不到,之後就查得到。順序不可對調。
+        """
+        if target_id in self.target_stats:
+            return
+        self.target_order.append(target_id)
+        self.root.after(0, self._refresh_target_options)
+
+    def _refresh_target_options(self):
+        """依 target_order 重建目標按鈕列;維持目前選取不變。
+        按鈕文字刻意只放 Entity ID (不含傷害數字),這樣只有「出現新對象」時才需要
+        重建,不必每筆傷害都動 widget。
+        ID 用 hex 呈現,與技能欄/開發者 log 的 0x + 8 碼慣例一致。
+        """
+        for btn in self.target_buttons.values():
+            btn.destroy()
+        self.target_buttons.clear()
+
+        def add(key, text, width):
+            btn = ctk.CTkButton(self.target_bar, text=text, width=width, height=26,
+                                corner_radius=6, font=(FONT_LOG, 12),
+                                fg_color=TARGET_BTN_IDLE, hover_color="#4a4a4a",
+                                command=lambda k=key: self._on_target_change(k))
+            btn.pack(side="left", padx=(0, 4))
+            self.target_buttons[key] = btn
+
+        add(TARGET_ALL, TARGET_ALL_LABEL, 46)
+        for tid in self.target_order:
+            add(tid, f"0x{tid:08X}", 96)
+
+        # 選取的目標已不存在 (例如 clear_data 之後) → 退回 All
+        if self.selected_target not in self.target_buttons:
+            self.selected_target = TARGET_ALL
+            self._refresh_stats_view()
+            self._render_log()
+        self._update_target_buttons_style()
+
+    def _sort_target_order(self):
+        """把 target_order 依累積傷害由大到小重排 (傷害相同維持原順序)。
+        回傳是否真的有變動,沒變就不必動 widget。
+        """
+        ordered = sorted(self.target_order,
+                         key=lambda tid: -self._bucket(tid)["damage"])
+        if ordered == self.target_order:
+            return False
+        self.target_order[:] = ordered
+        return True
+
+    def _reorder_target_buttons(self):
+        """依現有 target_order 重新 pack 既有按鈕 (All 固定第一個)。
+        不重建 widget,避免每 3 秒閃一次。
+        """
+        for key in (TARGET_ALL, *self.target_order):
+            btn = self.target_buttons.get(key)
+            if btn is None:
+                continue
+            btn.pack_forget()
+            btn.pack(side="left", padx=(0, 4))
+
+    def _tick_target_sort(self):
+        """每 TARGET_SORT_INTERVAL_MS 依累積傷害重排目標按鈕列。"""
+        try:
+            if self._sort_target_order():
+                self._reorder_target_buttons()
+        finally:
+            self._target_sort_after_id = self.root.after(
+                TARGET_SORT_INTERVAL_MS, self._tick_target_sort)
+
+    def _update_target_buttons_style(self):
+        """選中的目標按鈕用亮藍底,其餘用深灰底。"""
+        for key, btn in self.target_buttons.items():
+            btn.configure(fg_color=(TARGET_BTN_SELECTED if key == self.selected_target
+                                    else TARGET_BTN_IDLE))
+
+    def _on_target_change(self, key):
+        """點選目標按鈕 → 看板 / 技能排行 / 攻擊日誌三者一起換成該目標的資料。"""
+        self.selected_target = key
+        self._update_target_buttons_style()
+        self._refresh_stats_view()
+        self._render_log()
+
+    def _refresh_stats_view(self):
+        """把「目前選取目標」的統計重新畫到看板 + 技能排行。"""
+        b = self._view()
+        self.lbl_total_dmg.configure(text=f"{b['damage']:,}")
+        self.lbl_target_hits.configure(text=f"{b['hits']:,} 筆")
+        self.update_dps()
+        self.update_coverage()
+        self.update_skill_ranking()
+
     def update_coverage(self):
-        """更新爆擊/強擊/連擊覆蓋率顯示。樣本不足 COVERAGE_MIN_HITS 時維持「—」。"""
-        if self.total_hits < COVERAGE_MIN_HITS:
+        """更新 COVERAGE_TAGS 各項覆蓋率顯示。樣本不足 COVERAGE_MIN_HITS 時維持「—」。"""
+        b = self._view()
+        if b["hits"] < COVERAGE_MIN_HITS:
             for lbl in self.lbl_cov.values():
                 lbl.configure(text="—")
             return
         for tag_name, lbl in self.lbl_cov.items():
-            pct = self.tag_counts[tag_name] * 100 / self.total_hits
+            pct = b["tags"][tag_name] * 100 / b["hits"]
             lbl.configure(text=f"{pct:.1f}%")
 
     def update_dps(self):
-        if self.first_damage_time is None or self.last_damage_time is None:
+        b = self._view()
+        if b["first"] is None or b["last"] is None:
             self.lbl_dps.configure(text="0")
             return
-        elapsed = max(self.last_damage_time - self.first_damage_time, 1.0)
-        dps = self.total_damage / elapsed
-        self.lbl_dps.configure(text=f"{dps:,.0f}")
-
-    def get_entity_alias(self, entity_id):
-        if entity_id not in self.entity_map:
-            self.entity_count += 1
-            label = chr(64 + self.entity_count) if self.entity_count <= 26 else f"X{self.entity_count}"
-            self.entity_map[entity_id] = f"對象_{label}"
-        return self.entity_map[entity_id]
+        elapsed = max(b["last"] - b["first"], 1.0)
+        self.lbl_dps.configure(text=f"{b['damage'] / elapsed:,.0f}")
 
     # ================================================
     # 封包解析
@@ -2332,6 +2860,298 @@ class LiveDamageMonitor:
             scan += 1
         return None
 
+    @staticmethod
+    def _brotli_head(data, n):
+        """解壓 Brotli content,回傳前 n bytes;無法解壓則 None。
+
+        優先走串流式 Decompressor — 跨 TCP 分段被截斷的封包餵進去仍能吐出開頭
+        幾十 bytes,而 entityId 就在最前面 4 bytes,這正是我們要的。方法名在新舊版
+        分別是 decompress / process,兩個都試;串流式失敗才退回一次性 decompress。
+        純診斷用,任何例外都吞掉回 None,不得影響掃描。
+        """
+        if _BROTLI is None or not data:
+            return None
+        try:
+            dec = _BROTLI.Decompressor()
+            for method in ("decompress", "process"):
+                fn = getattr(dec, method, None)
+                if fn is None:
+                    continue
+                try:
+                    out = fn(bytes(data))
+                except Exception:
+                    continue
+                if out:
+                    return out[:n]
+        except Exception:
+            pass
+        try:
+            return _BROTLI.decompress(bytes(data))[:n]
+        except Exception:
+            return None
+
+    # ================================================
+    # 角色身分偵測 (純觀測)
+    # 規則見檔頭 IDENT_* 常數的註解;實作分三塊:
+    #   _scan_identity      每個封包的入口
+    #   _ident_*_self       A 訊息 (0x4FFF) → 我的身分
+    #   _ident_*_appear     B 訊息 (0x4E4F) → 實體 ID ↔ 身分,比對出「自己」
+    # ================================================
+
+    def _ident_reset(self):
+        """清空身分偵測狀態 (開檔即呼叫,「清除」也會重來一次)。"""
+        self.ident_self = None            # (accountInfo, characterIndex)
+        self.ident_self_entity = None     # 本場綁定的「自己」實體 ID
+        self._ident_appear_cache = collections.OrderedDict()   # eid → 解壓後的明文
+        self._ident_streams = collections.OrderedDict()        # 連線 key → 進行中的訊息
+        self._ident_self_hdr_seen = 0     # 總共掃到幾次 A 訊息標頭
+        self._ident_ok_logged = False     # 綠字「已獲得角色ID資訊」只寫一次
+        self._ident_new_scene()
+
+    def _ident_new_scene(self):
+        """每收到一則 A 訊息 (= 換場景 / 重新載入角色資料) 就重來一輪統計。"""
+        self._ident_scene_appear = 0      # 本場收到幾筆玩家出現訊息
+        self._ident_scene_full = 0        # 其中 body 完整收齊的幾筆
+        self._ident_scene_hit = 0         # 命中自己的幾筆
+        self._ident_scene_warned = False  # 開發者面板的「本場尚未綁定」是否已警告過
+        self._ident_no_id_logged = False  # 攻擊日誌的紅字本場是否已寫過
+
+    def _ident_log(self, msg):
+        self.root.after(0, lambda m=msg: self.dev_log(m))
+
+    def _ident_notify_ok(self):
+        """首次取得角色 ID 時寫一行綠字 (由 sniff 執行緒呼叫,故走 after)。
+
+        只寫「第一次」— 換場景會不斷解除/重新綁定,每次都報一遍只是洗版;
+        按「開始」「清除」也不再重報。使用者真正需要被提醒的是「還沒有 ID」那個狀態。
+        """
+        if self._ident_ok_logged:
+            return
+        self._ident_ok_logged = True
+        self.root.after(0, lambda: self._append_log(IDENT_MSG_OK, color="ident_ok"))
+
+    def _ident_warn_no_id(self):
+        """尚未取得角色 ID → 紅字提醒 (本場只寫一次)。"""
+        if self._ident_no_id_logged:
+            return
+        self._ident_no_id_logged = True
+        self.root.after(0, lambda: self.log_error(IDENT_MSG_NONE))
+
+    def _ident_status_line(self):
+        """啟動 / 按「開始」/ 按「清除」時的狀態提示 (主執行緒)。
+        只在「還沒有角色 ID」時出聲 — 有 ID 是正常狀態,不需要每次都報。
+        """
+        if self.force_all:
+            return          # 強制偵測下傷害照收,沒有角色 ID 也不是問題
+        if self.ident_self_entity is None:
+            self._ident_no_id_logged = True
+            self.log_error(IDENT_MSG_NONE)
+
+    def _scan_identity(self, payload, key=None):
+        """身分偵測入口 — 任何例外都不得影響其他解析。
+
+        payload 走「訊息狀態機」而非逐封包獨立解析:一則訊息的 body 常跨好幾個
+        TCP 分段 (玩家出現 1~3KB、我的角色資料 100KB+),而 characterId 可能落在
+        解壓後 2600 bytes 之後 —— 只解單一分段內那一截永遠讀不到。
+        """
+        try:
+            self._ident_walk(payload, key)
+        except Exception:
+            pass
+
+    def _ident_walk(self, payload, key):
+        n = len(payload)
+        pos = 0
+        # 1. 前面的位元組若屬於還沒收完的訊息,先交給它
+        st = self._ident_streams.get(key)
+        if st is not None:
+            take = min(st["need"], n)
+            self._ident_feed(key, payload[:take])
+            pos = take
+        # 2. 剩下的位元組繼續找下一則訊息的 9-byte 標頭
+        while pos + 9 <= n:
+            cand, kind = -1, None
+            for magic, k in ((IDENT_SELF_MAGIC, "self"), (IDENT_APPEAR_MAGIC, "appear")):
+                p = payload.find(magic, pos)
+                if p >= 0 and (cand < 0 or p < cand):
+                    cand, kind = p, k
+            if cand < 0 or cand + 9 > n:
+                return
+            size = struct.unpack("<i", payload[cand+4:cand+8])[0]
+            enc = payload[cand+8]
+            lo = IDENT_SELF_MIN_SIZE if kind == "self" else IDENT_APPEAR_MIN_SIZE
+            if enc != 1 or not (lo <= size <= IDENT_MAX_SIZE):
+                pos = cand + 1        # 對錯位撞出來的假標頭,往後挪 1 byte 重找
+                continue
+            self._ident_open(key, kind, size, payload[cand+9:cand+9+size])
+            pos = cand + 9 + size     # 訊息跨段時 pos > n,迴圈結束,剩下的由下個封包接
+
+    def _ident_open(self, key, kind, size, body):
+        """開一則新訊息:建串流解壓器,餵入本封包內已有的那一截。"""
+        if kind == "self":
+            self._ident_self_hdr_seen += 1
+            self._ident_log(f"[ID] 我的角色資料 type=0x{IDENT_SELF_TYPE:04X} "
+                            f"len={size} enc=1 (第{self._ident_self_hdr_seen}次)")
+        fn = None
+        if _BROTLI is not None:
+            try:
+                dec = _BROTLI.Decompressor()
+                # 方法名在新舊版分別是 decompress / process,只挑一個 (兩個都呼叫會重複餵)
+                fn = getattr(dec, "decompress", None) or getattr(dec, "process", None)
+            except Exception:
+                fn = None
+        if fn is None:
+            if kind == "self":
+                self._ident_log("[ID] 未安裝 brotli,無法解出自己的身分 (pip install brotli)")
+            kind = "skip"
+        st = {"kind": kind, "size": size, "need": size, "got": 0,
+              "fn": fn, "out": bytearray(), "done": False}
+        self._ident_streams[key] = st
+        while len(self._ident_streams) > IDENT_STREAM_MAX:
+            self._ident_streams.popitem(last=False)
+        self._ident_feed(key, body)
+
+    def _ident_feed(self, key, data):
+        """把 data 當成該連線目前這則訊息的後續 body。
+
+        kind 三態:
+          appear — 邊收邊解壓,湊到 IDENT_APPEAR_HEAD_BYTES 或收完就結算
+          self   — 同上,但吐出前 8 bytes 就夠了,之後轉 skip
+          skip   — 只倒數 need、不解壓。A 訊息 body 有 100KB+,不轉 skip 的話
+                   後續幾十個封包的壓縮位元組會被當成訊息邊界亂掃
+        """
+        st = self._ident_streams.get(key)
+        if st is None:
+            return
+        st["got"] += len(data)
+        st["need"] -= len(data)
+        if data and st["kind"] != "skip":
+            try:
+                out = st["fn"](bytes(data))
+            except Exception as exc:
+                if st["kind"] == "self":
+                    self._ident_log(f"[ID] 我的角色資料解壓中斷 ({exc.__class__.__name__}),"
+                                    f"已收 {st['got']}B — 本工具不做 TCP 重組,"
+                                    f"重傳或亂序會直接打斷串流")
+                st["kind"] = "skip"
+                out = b""
+            if out:
+                st["out"] += out
+            if st["kind"] == "self":
+                if len(st["out"]) >= 8:
+                    self._ident_apply_self(bytes(st["out"][:8]), st["got"])
+                    st["kind"] = "skip"
+                    st["out"] = bytearray()
+                elif st["got"] >= IDENT_SELF_FEED_MAX:
+                    self._ident_log(f"[ID] 已收 {st['got']}B 仍吐不出前 8 bytes,放棄本則")
+                    st["kind"] = "skip"
+            elif st["kind"] == "appear" and len(st["out"]) >= IDENT_APPEAR_HEAD_BYTES:
+                self._ident_finish_appear(st)
+                st["kind"] = "skip"
+        if st["need"] <= 0:
+            if st["kind"] == "appear":
+                self._ident_finish_appear(st)
+            self._ident_streams.pop(key, None)
+
+    def _ident_apply_self(self, head8, got):
+        """解出的前 8 bytes → 我的身分。reserved 必須是 0,拿來擋假陽性。
+
+        A 訊息 = 換場景 (或換角色) 的信號:實體 ID 一定跟著換,所以**一律解除舊綁定**,
+        身分保留下來去比對新場景的玩家。沿用舊綁定會把「自己」指到別人身上。
+        """
+        index, account, reserved = struct.unpack("<HIH", head8)
+        if reserved != 0:
+            self._ident_log(f"[ID] 解出 reserved={reserved} ≠ 0 → 判為假陽性,丟棄")
+            return
+        ident = (account, index)
+        prev_entity = self.ident_self_entity
+        self.ident_self_entity = None
+        self._ident_new_scene()   # 紅字提醒也重新武裝:本場真的打不進統計時才會出聲
+        if ident == self.ident_self:
+            old = f"0x{prev_entity:08X}" if prev_entity is not None else "無"
+            self._ident_log(f"[ID] 場景更新 (身分不變: 帳號碼={account} 角色索引={index}),"
+                            f"解除舊綁定 {old},等待重新比對")
+            return
+        if self.ident_self is not None:
+            self._ident_log(f"[ID] 身分改變 {self.ident_self} → {ident} = 換角色,"
+                            f"清掉舊綁定重新偵測")
+        self.ident_self = ident
+        self._ident_log(f"[ID] 我的身分: 帳號碼={account} 角色索引={index} | "
+                        f"characterId=0x{(account << 16 | index):016X} "
+                        f"(收 {got}B 後解出)")
+        self._ident_rescan_cache()
+
+    # ---- B: 玩家出現 0x4E4F ----
+
+    def _ident_finish_appear(self, st):
+        """一則玩家出現訊息收尾:解壓內容 → 實體 ID + 比對身分,並記一行診斷。"""
+        if st["done"]:
+            return
+        st["done"] = True
+        plain = bytes(st["out"])
+        full = st["need"] <= 0
+        self._ident_scene_appear += 1
+        if full:
+            self._ident_scene_full += 1
+        eid = struct.unpack("<I", plain[:4])[0] if len(plain) >= 4 else None
+        off = None
+        if eid is not None:
+            if self.ident_self is None:
+                # 身分還沒到手 → 先留著,等 A 訊息來了回頭掃 (兩個方向都要做)
+                self._ident_appear_cache.pop(eid, None)
+                self._ident_appear_cache[eid] = plain
+                while len(self._ident_appear_cache) > IDENT_APPEAR_CACHE_MAX:
+                    self._ident_appear_cache.popitem(last=False)
+            else:
+                off = self._ident_match_offset(plain)
+        # 別人的出現訊息不寫 LOG (一次換圖十幾筆,只會洗版) — 只累計數字,
+        # 供「本場尚未綁定」那行診斷用
+        if off is not None:
+            self._ident_scene_hit += 1
+            self._ident_bind(eid, off)
+
+    def _ident_match_offset(self, plain):
+        """在解壓內容裡找 u64 characterId == 我的身分,回傳位移;沒有則 None。
+
+        比對鍵是帳號碼與角色索引「兩個都要相等」— 拆開比會綁到同帳號的別隻角色,
+        或撞到別的帳號 (角色索引 4、5 這種小數字滿地都是)。
+        """
+        if self.ident_self is None:
+            return None
+        account, index = self.ident_self
+        off = plain.find(struct.pack("<Q", account << 16 | index))
+        return None if off < 0 else off
+
+    def _ident_bind(self, eid, off):
+        if self.ident_self_entity == eid:
+            return
+        prev = self.ident_self_entity
+        self.ident_self_entity = eid
+        note = (f" (原 0x{prev:08X} → 重新綁定)" if prev is not None else " (本場首次綁定)")
+        self._ident_log(f"[ID] ★ 自己 = 實體 0x{eid:08X}{note} | "
+                        f"characterId 位於解壓後位移 +{off}")
+        self._ident_notify_ok()
+        # 治癒端的 0x502A 學習是唯一獨立於本規則的自身 ID 來源 (見 parse_heal_shield §5),
+        # 學到的話拿來當第二個佐證 —— 只有一個來源就分不出對錯
+        lp = self.local_player_id
+        if lp is not None:
+            same = "一致" if (lp & 0xFFFFFFFF) == eid else "不一致"
+            self._ident_log(f"[ID] 對照治癒端學到的本地 ID 0x{lp:X}: {same}")
+
+    def _ident_rescan_cache(self):
+        """A 訊息晚到:回頭掃已快取的 B 訊息。"""
+        if not self._ident_appear_cache:
+            return
+        hits = 0
+        for eid, plain in list(self._ident_appear_cache.items()):
+            off = self._ident_match_offset(plain)
+            if off is not None:
+                hits += 1
+                self._ident_bind(eid, off)
+        self._ident_log(f"[ID] 回掃 {len(self._ident_appear_cache)} 筆已快取的玩家出現訊息,"
+                        f"命中 {hits} 筆")
+        self._ident_appear_cache.clear()
+
     def parse_payload(self, payload):
         offset = 0
         payload_len = len(payload)
@@ -2343,36 +3163,101 @@ class LiveDamageMonitor:
 
                     if offset + 55 <= payload_len:
                         dmg_val = struct.unpack("<I", payload[offset+25:offset+29])[0]
+                        # 攻擊對象 ID (protocol: UInt32 targetId @ content+8 = offset+17)
+                        # 用於「目標篩選」分桶與日誌歸屬;offset+55 的長度檢查已涵蓋此範圍
+                        target_id = struct.unpack("<I", payload[offset+17:offset+21])[0]
+                        # 攻擊者 ID (protocol: UInt32 userId @ content+0 = offset+9);
+                        # offset+55 的長度守門已涵蓋 offset+9..13
+                        attacker_id = struct.unpack("<I", payload[offset+9:offset+13])[0]
+                        # 統計門檻:沒認出自己的實體 ID 就完全不記錄,認出後也只記
+                        # 「攻擊者 == 自己」的傷害 (見 _scan_identity / 身分筆記)。
+                        # 勾了「⚡ 強制偵測」就整個旁路,全部收 (見 toggle_force_all)。
+                        is_self_hit = self.force_all or (
+                            self.ident_self_entity is not None
+                            and attacker_id == self.ident_self_entity)
 
-                        # 1. 過濾傷害免疫
+                        # 1. 過濾傷害免疫 (仍歸屬到該目標,切換目標時一起被過濾)
                         if dmg_val == 0xFFFFFFFF:
-                            msg = "🛡️ [傷害免疫] 數值: 免疫 (0xFFFFFFFF)"
-                            self.root.after(0, lambda m=msg: self.log(m))
+                            if is_self_hit:
+                                msg = "🛡️ [傷害免疫] 數值: 免疫 (0xFFFFFFFF)"
+                                self.root.after(0, lambda m=msg, tid=target_id:
+                                                self.log_damage(m, (), tid))
                             offset += (size + 8) if size > 0 else 35
                             continue
 
                         # 2. 讀取標籤旗標
-                        b41 = payload[offset+41] if offset+41 < payload_len else 0
-                        b42 = payload[offset+42] if offset+42 < payload_len else 0
+                        #    旗標區為連續 7 bytes (見筆記 §4);flags[0]=b41, flags[1]=b42
+                        #    flags[3..4] 的元素/追擊位元尚未驗證,只作診斷用
+                        flags = [
+                            payload[offset + DMG_FLAG_BASE + i]
+                            if offset + DMG_FLAG_BASE + i < payload_len else 0
+                            for i in range(DMG_FLAG_LEN)
+                        ]
+                        b41 = flags[0]
+                        b42 = flags[1]
                         b57 = payload[offset+57] if offset+57 < payload_len else 0
 
+                        # 持續傷害 (DoT):已確認,用於在技能名稱後加註 (Dot)
+                        is_dot = any(flags[idx] & mask for idx, mask in DMG_DOT_BITS)
+
                         # 嘗試從後續的 0x4fc5 TLV 抽出 skill_id (可能為 None)
+                        # 事件實際總長為 9 + size (標頭含 encodingType),這裡刻意用 +8 起掃:
+                        # 起點早 1 byte 只是多掃一輪,起點晚 1 byte 會直接跳過 magic。
                         skill_id = self.find_skill_id_after(payload, offset + 8 + size)
 
                         if self.is_dev_mode:
+                            # 開發者面板不受統計門檻影響:別人的傷害照印,
+                            # 這是驗證身分偵測對不對的唯一依據
                             skill_txt = f"0x{skill_id:08X}" if skill_id is not None else "(未取得)"
+                            flags_txt = " ".join(f"{b:02X}" for b in flags)
+                            # 候選位元:僅顯示,不影響統計。用來驗證 packet-protocol.md 的推論
+                            hits = [name for idx, mask, name in DMG_FLAG_CANDIDATES
+                                    if flags[idx] & mask]
+                            cand_txt = f" | 候選: {'+'.join(hits)}" if hits else ""
+                            # DoT / 額外傷害 各自拆到 bit 層級顯示,方便比對不同來源
+                            dot_bits = [lbl for idx, mask, lbl in DMG_DOT_BIT_LABELS
+                                        if flags[idx] & mask]
+                            extra_bits = [lbl for idx, mask, lbl in DMG_EXTRA_BIT_LABELS
+                                          if flags[idx] & mask]
+                            dot_txt = f" | DoT({'+'.join(dot_bits)})" if dot_bits else ""
+                            if extra_bits:
+                                dot_txt += f" | 額外({'+'.join(extra_bits)})"
+                            # 本場第一筆傷害仍未綁定 → 把診斷數據印出來,
+                            # 用來分辨「沒收到出現訊息」還是「收到但解壓不夠長」
+                            if (self.ident_self_entity is None
+                                    and not self._ident_scene_warned):
+                                self._ident_scene_warned = True
+                                self._ident_log(
+                                    f"[ID] ⚠ 本場尚未綁定 — 已收到 "
+                                    f"{self._ident_scene_appear} 筆出現訊息 "
+                                    f"(完整 {self._ident_scene_full} 筆, "
+                                    f"命中 {self._ident_scene_hit} 筆)")
                             dev_msg = (f"[Flag] 數值: {dmg_val} | "
-                                       f"b41:{b41:02X} b42:{b42:02X} b57:{b57:02X} | "
-                                       f"技能: {skill_txt}")
+                                       f"攻擊者:0x{attacker_id:08X} → 目標:0x{target_id:08X} | "
+                                       f"flags[41-47]: {flags_txt} | b57:{b57:02X} | "
+                                       f"技能: {skill_txt}{dot_txt}{cand_txt}")
                             self.root.after(0, lambda m=dev_msg: self.dev_log(m))
+
+                        # 2.4 統計門檻:只記錄自己打出去的傷害。
+                        #     還沒認出自己的實體 ID 前一律不記 —— 沒有身分就無從分辨
+                        #     哪些是自己的,寧可不記也不要記成別人的 (日誌上會有紅字提示)。
+                        if not is_self_hit:
+                            if self.ident_self_entity is None:
+                                # 真的有傷害被丟掉時才提醒 (本場一次),換場景瞬間不出聲 —
+                                # 綁定通常一秒內就補回來,提早報只會變成每次換圖閃一行紅字
+                                self._ident_warn_no_id()
+                            offset += (size + 8) if size > 0 else 35
+                            continue
 
                         # 3. 標籤解析
                         #    b41: bit0=爆擊, bit2=無防備(排除破防), bit3=破防
-                        #         bit6=非標籤(用途不明,已忽略), bit7=普通攻擊旗標(自動攻擊=1)
+                        #         bit6=首擊(first_hit,非標籤), bit7=普通攻擊旗標(自動攻擊=1)
                         #    b42: bit0=多重打擊, bit1=強擊, bit2=連擊
+                        #         bit3+bit7=持續傷害(DoT),不當標籤,改在技能名後加註 (Dot)
+                        #    b44: bit3=追擊 (未驗證,見 DMG_ADD_HIT_BIT)
                         #    b57: bit0=破防 (備援旗標)
                         KNOWN_MASK_B41 = 0xCD
-                        KNOWN_MASK_B42 = 0x07
+                        KNOWN_MASK_B42 = 0x8F   # 原 0x07;bit3/bit7 已確認為 DoT,不再報未知
 
                         tags = []
                         if b41 & 0x01:
@@ -2387,6 +3272,9 @@ class LiveDamageMonitor:
                             tags.append("連擊")
                         if b42 & 0x01:
                             tags.append("多重打擊")
+                        # 追擊:位置來自 packet-protocol.md,尚未錄到本地樣本驗證
+                        if flags[DMG_ADD_HIT_BIT[0]] & DMG_ADD_HIT_BIT[1]:
+                            tags.append("追擊")
 
                         unknown_b41 = b41 & ~KNOWN_MASK_B41 & 0xFF
                         unknown_b42 = b42 & ~KNOWN_MASK_B42 & 0xFF
@@ -2400,42 +3288,51 @@ class LiveDamageMonitor:
 
                         tag_str = f"[{'+'.join(tags)}]" if tags else "[普通]"
 
-                        # 4. 傷害累加 + DPS 時間戳更新 + 標籤計數
-                        self.total_damage += dmg_val
+                        # 4. 傷害累加:同一筆同時進 TARGET_ALL 與該攻擊對象兩個桶
+                        self._register_target(target_id)
                         now = time.time()
-                        if self.first_damage_time is None:
-                            self.first_damage_time = now
-                        self.last_damage_time = now
+                        for _key in (TARGET_ALL, target_id):
+                            b = self._bucket(_key)
+                            b["damage"] += dmg_val
+                            if b["first"] is None:
+                                b["first"] = now
+                            b["last"] = now
+                            b["hits"] += 1
+                            for name in b["tags"]:
+                                if name in tags:
+                                    b["tags"][name] += 1
+                            # 累加該技能的傷害/命中/標籤 (skill_id 抓不到就不列入排行)
+                            if skill_id is not None:
+                                b["skill_damage"][skill_id] = b["skill_damage"].get(skill_id, 0) + dmg_val
+                                b["skill_hits"][skill_id] = b["skill_hits"].get(skill_id, 0) + 1
+                                per = b["skill_tags"].setdefault(
+                                    skill_id, {n: 0 for n in COVERAGE_TAGS})
+                                for _tn in COVERAGE_TAGS:
+                                    if _tn in tags:
+                                        per[_tn] += 1
 
-                        self.total_hits += 1
-                        for name in self.tag_counts:
-                            if name in tags:
-                                self.tag_counts[name] += 1
-
-                        # 累加該技能的傷害 + 命中次數 + 標籤次數 (skill_id 抓不到就不列入排行)
-                        if skill_id is not None:
-                            self.skill_damage[skill_id] = self.skill_damage.get(skill_id, 0) + dmg_val
-                            self.skill_hits[skill_id] = self.skill_hits.get(skill_id, 0) + 1
-                            if skill_id not in self.skill_tag_counts:
-                                self.skill_tag_counts[skill_id] = {"爆擊": 0, "強擊": 0, "連擊": 0}
-                            for _tn in ("爆擊", "強擊", "連擊"):
-                                if _tn in tags:
-                                    self.skill_tag_counts[skill_id][_tn] += 1
-                            self.root.after(0, self.update_skill_ranking)
-
-                        self.root.after(0, lambda d=self.total_damage: self.lbl_total_dmg.configure(text=f"{d:,}"))
-                        self.root.after(0, self.update_dps)
-                        self.root.after(0, self.update_coverage)
+                        # 只有這筆會影響到「目前顯示中的目標」時才重畫
+                        if self.selected_target in (TARGET_ALL, target_id):
+                            self.root.after(0, self._refresh_stats_view)
 
                         # 技能欄:優先用 skills.ini 對照,skill_id=0 標為符文,否則顯示 hex ID
+                        #        持續傷害在名稱後加註 (Dot) — DoT 旗標來自傷害事件本身,
+                        #        與 skill_id 是否取得無關,所以兩種情況都要加。
                         if skill_id is None:
                             skill_display = "?" * 10
                         else:
                             skill_display = format_skill_name(skill_id)
-                        # tab 分隔欄位,tab stop 已在初始化時設定於固定像素位置
-                        msg = f"{skill_display}\t{dmg_val:>10,}\t{tag_str}"
-                        self.root.after(0, lambda m=msg, t=list(tags): self.log_damage(m, t))
+                        if is_dot:
+                            skill_display += DMG_DOT_SUFFIX
+                        # tab 分隔欄位,tab stop 已在初始化時設定於固定像素位置。
+                        # 行首多一個 tab:傷害值靠第一個 (right) 停靠點右對齊,
+                        # 不再補空白 — 補空白只在等寬字體下才對得齊。
+                        msg = f"\t{dmg_val:,}\t{tag_str}\t{skill_display}"
+                        self.root.after(0, lambda m=msg, t=list(tags), tid=target_id:
+                                        self.log_damage(m, t, tid))
 
+                    # 事件實際總長為 9 + size,但這裡維持 +8:主迴圈是逐 byte 掃 magic,
+                    # 落在前 1 byte 會自動被下一輪修正;落在後 1 byte 則會整個跳過下一筆。
                     offset += (size + 8) if size > 0 else 35
                     continue
                 except Exception:
@@ -2684,26 +3581,54 @@ class LiveDamageMonitor:
         self.lbl_heal_self.configure(text=f"{self.heal_self:,}")
         self.lbl_heal_ally.configure(text=f"{self.heal_ally:,}")
 
-    def packet_callback(self, packet):
-        if not (self.is_monitoring and packet.haslayer(TCP) and packet.haslayer(IP)):
+    def packet_callback(self, packet, gen=0):
+        # 換網卡時舊執行緒可能還沒退出 — 世代不符就整包丟掉,避免重複處理
+        if gen != self._sniff_gen:
+            return
+        if not (packet.haslayer(TCP) and packet.haslayer(IP)):
             return
         raw_payload = bytes(packet[TCP].payload)
         if not raw_payload:
+            return
+        # 身分偵測不受「開始/停止」與開發者模式影響:換地圖那一瞬間的
+        # 0x4FFF/0x4E4F 只送一次,錯過就要等下次換圖,所以一律掃。
+        # 訊息 body 跨封包接續,所以要依連線分流 — 混到別條連線的位元組會把串流解壓弄壞。
+        ip_layer, tcp_layer = packet[IP], packet[TCP]
+        self._scan_identity(raw_payload,
+                            (ip_layer.src, tcp_layer.sport,
+                             ip_layer.dst, tcp_layer.dport))
+        if not self.is_monitoring:
             return
         if self.track_damage:
             self.parse_payload(raw_payload)
         if self.track_heal:
             self.parse_heal_shield(raw_payload)
 
-    def sniff_packets(self):
+    def _ensure_sniffer(self, restart=False):
+        """確保攔截執行緒在跑。
+
+        它獨立於「開始/停止」:身分偵測要在沒按開始時也能認出自己 (見
+        packet_callback),所以程式一啟動就開始收,直到關閉為止。
+        restart=True 用於換網卡 — 世代 +1 讓舊執行緒在下一個封包自行退出。
+        """
+        if restart:
+            self._sniff_gen += 1
+            self.sniff_thread = None
+        if self.sniff_thread is not None and self.sniff_thread.is_alive():
+            return
+        gen = self._sniff_gen
+        self.sniff_thread = threading.Thread(target=self.sniff_packets,
+                                             args=(gen,), daemon=True)
+        self.sniff_thread.start()
+
+    def sniff_packets(self, gen=0):
         bpf_filter = f"ip net {IP_FILTER_NET} and tcp"
         try:
-            self.log("=== 已啟動監控 ===")
             sniff_kwargs = {
                 "filter": bpf_filter,
-                "prn": self.packet_callback,
+                "prn": lambda pkt: self.packet_callback(pkt, gen),
                 "store": 0,
-                "stop_filter": lambda _: not self.is_monitoring,
+                "stop_filter": lambda _: gen != self._sniff_gen,
             }
             # 若已由開機自動偵測 or 手動掃描選定網卡,就綁在那張;否則交給 scapy 自選
             if self.chosen_iface:
@@ -2738,8 +3663,10 @@ class LiveDamageMonitor:
         self.update_skill_ranking()
 
         self.log("=== 已啟動即時監控 ===")
-        self.sniff_thread = threading.Thread(target=self.sniff_packets, daemon=True)
-        self.sniff_thread.start()
+        # 攔截執行緒通常在程式啟動時就跑起來了;這裡只是保險 (例如當初啟動失敗)
+        self._ensure_sniffer()
+        # 沒有角色 ID 就不會記任何傷害 — 開始的當下一定要讓使用者看到現況
+        self._ident_status_line()
 
     def start_timer(self):
         """讀取分/秒輸入 → 清資料 → 啟動監控 → 開始倒數。
@@ -2838,23 +3765,16 @@ class LiveDamageMonitor:
 
     def clear_data(self):
         # === 傷害端 ===
-        self.total_damage = 0
-        self.entity_map.clear()
-        self.entity_count = 0
-        self.first_damage_time = None
-        self.last_damage_time = None
+        # 所有目標桶一起丟掉並退回 All,下一場重新累積
+        self.target_stats = {TARGET_ALL: self._new_stat_bucket()}
+        self.target_order.clear()
+        self.selected_target = TARGET_ALL
+        self._refresh_target_options()
 
-        self.total_hits = 0
-        for name in self.tag_counts:
-            self.tag_counts[name] = 0
-
-        self.skill_damage.clear()
-        self.skill_hits.clear()
-        self.skill_tag_counts.clear()
         self.update_skill_ranking()
-
         self.lbl_total_dmg.configure(text="0")
         self.lbl_dps.configure(text="0")
+        self.lbl_target_hits.configure(text="0 筆")
         self.update_coverage()
 
         # === 治癒端 ===
@@ -2865,20 +3785,31 @@ class LiveDamageMonitor:
         self.heal_ally = 0
         self._update_heal_banner()
 
-        # 解鎖 → 清空 → 鎖回
-        self.log_area.configure(state="normal")
-        self.log_area.delete("1.0", "end")
-        self.log_area.configure(state="disabled")
+        # 事件緩衝與畫面一起清 (只清 widget 的話切換目標會把舊事件叫回來)
+        self.log_entries.clear()
+        self._render_log()
 
         self.heal_log_area.configure(state="normal")
         self.heal_log_area.delete("1.0", "end")
         self.heal_log_area.configure(state="disabled")
 
-        self.dev_log_area.configure(state="normal")
-        self.dev_log_area.delete("1.0", "end")
-        self.dev_log_area.configure(state="disabled")
+        # 診斷視窗可能沒開;緩衝與底部單行也要一起清,免得重開後舊資料又冒出來
+        self._dev_lines.clear()
+        try:
+            self.dev_strip.configure(text=DEV_STRIP_EMPTY)
+        except Exception:
+            pass
+        if self.dev_log_area is not None:
+            self.dev_log_area.configure(state="normal")
+            self.dev_log_area.delete("1.0", "end")
+            self.dev_log_area.configure(state="disabled")
 
         self.log("=== 數據已歸零 ===")
+        # 注意:身分/綁定不清零 — 清了就得等下次換地圖才會再認出自己,
+        # 中間所有傷害都不會被記錄 (同 local_player_id 的處置)。
+        # 只把「本場尚未綁定」的診斷警告重新武裝,並把目前狀態重寫一行到日誌。
+        self._ident_scene_warned = False
+        self._ident_status_line()
 
 
 if __name__ == "__main__":

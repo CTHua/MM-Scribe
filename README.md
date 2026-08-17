@@ -193,14 +193,14 @@ popout_skill = false           ; 技能傷害排行獨立視窗
 **開發版**（顯示開發者選項）：
 
 ```bash
-python -m PyInstaller --onefile --noconsole --collect-data customtkinter MabinogiMobileScribe_Beta_V0.43.py
+python -m PyInstaller --onefile --noconsole --collect-data customtkinter MabinogiMobileScribe_Beta_V0.50.py
 ```
 
 **發布版**（隱藏開發者選項）：
 
 ```bash
 type nul > RELEASE.marker
-python -m PyInstaller --onefile --noconsole --collect-data customtkinter --add-data "RELEASE.marker;." MabinogiMobileScribe_Beta_V0.43.py
+python -m PyInstaller --onefile --noconsole --collect-data customtkinter --add-data "RELEASE.marker;." MabinogiMobileScribe_Beta_V0.50.py
 ```
 
 ### macOS
@@ -209,7 +209,7 @@ python -m PyInstaller --onefile --noconsole --collect-data customtkinter --add-d
 
 ```bash
 touch RELEASE.marker
-python -m PyInstaller --windowed --collect-data customtkinter --add-data "RELEASE.marker:." MabinogiMobileScribe_Beta_V0.43.py
+python -m PyInstaller --windowed --collect-data customtkinter --add-data "RELEASE.marker:." MabinogiMobileScribe_Beta_V0.50.py
 ```
 
 PyInstaller 只會做 ad-hoc 簽章（沒有 Team ID），因此 `.app` 一定會被 Gatekeeper 攔下，
