@@ -23,6 +23,7 @@ macOS 上遊戲為 iOS App on Mac,流量直接走實體網卡,抓法與 Windows 
 """
 import collections
 import configparser
+import json
 import os
 import struct
 import sys
@@ -84,6 +85,9 @@ VERSION_STR = "Beta V0.50"
 COVERAGE_MIN_HITS = 10  # 覆蓋率計算所需最少樣本數
 # 需要統計覆蓋率的標籤 (上方面板、技能排行展開明細共用同一份;順序即顯示順序)
 COVERAGE_TAGS = ("爆擊", "強擊", "連擊", "追擊")
+# 持續傷害 (見 DMG_SUSTAIN_BITS) 只計入這幾個標籤的覆蓋率:它不是玩家直接命中,
+# 不會觸發強擊/連擊/追擊,分子分母都要排除,只有爆擊照算。
+COVERAGE_TAGS_SUSTAIN = ("爆擊",)
 # 目標篩選:TARGET_ALL 是「全部對象」的彙總桶,其餘 key 為 target_id (int)
 TARGET_ALL = "__ALL__"
 TARGET_ALL_LABEL = "All"
@@ -122,8 +126,16 @@ DMG_DOT_BITS = ((4, 0x10),)
 DMG_DOT_SUFFIX = "(Dot)"
 # 「非直接命中的額外傷害」通用標記 — DoT / 追加傷害 / 地面傷害都會亮,
 # 因此不足以判定 DoT (舊版誤把這組當成 DoT,導致追加傷害被標成 Dot)。
-# 目前僅供開發者面板診斷,不影響統計。
 DMG_EXTRA_BITS = ((1, 0x08), (1, 0x80), (2, 0x01))
+# 持續傷害 (遊戲內敘述用語,不是封包意義的 DoT):額外傷害三個位元全亮、DoT 位元沒亮。
+#   樣本 5技 高潮(終章) 0x6E202640,flags = 05/00/01 88 01 00 00:
+#     b41=00        → 2723 / 3009 / 2960   (基準)
+#     b41=01 爆擊    → 5359 / 5839          (約 1.9x)
+#     b41=05 爆+無防 → 7594 / 7680 / 7334   (約 2.6x)
+#   倍率乾淨且會爆擊 → 走正常傷害計算,與 DoT (b41 恆 00、每跳定值) 明顯不同。
+#   ⚠ 地面傷害同樣符合這個條件,旗標層面無法再細分 (見筆記 §4.2 / §4.4)。
+DMG_SUSTAIN_BITS = DMG_EXTRA_BITS
+DMG_SUSTAIN_SUFFIX = "(間接)"
 # 開發者模式用:把上面兩組拆回「是哪幾個 bit 亮的」。格式: (flags index, mask, 標籤)
 DMG_DOT_BIT_LABELS = ((4, 0x10, "45.10"),)
 DMG_EXTRA_BIT_LABELS = ((1, 0x08, "42.08"), (1, 0x80, "42.80"), (2, 0x01, "43.01"))
@@ -184,6 +196,31 @@ DEV_STRIP_MAX_CHARS = 160         # 單行顯示上限,超過截斷加省略號
 DEV_STRIP_EMPTY = "🛠 診斷 LOG — 尚無訊息  (點擊展開)"
 IDENT_SELF_MAGIC = struct.pack("<I", IDENT_SELF_TYPE)
 IDENT_APPEAR_MAGIC = struct.pack("<I", IDENT_APPEAR_TYPE)
+# ---- 怪物登場包探針 (0x4E4C) — 開發者 LOG 觀測用,不進統計 ----
+# CHANNEL_AppearingAutomaton_NTF:怪物/召喚物/機關進視野時送,framed、enc=1,
+# 版面與玩家出現 (0x4E4F) 同族,只差 opcode。解壓後前 4 bytes 一樣是 entityId,
+# 但「怪物碼」沒有固定位移 — 要從尾端往前掃哨兵:
+#     03 00 00 00 | [4 bytes 怪物碼] | 00 00 00 00
+# 怪物碼是全域型別鍵 (同種怪在哪一場都一樣),拿 8 字元大寫 hex 去對照表查名字。
+# 戰鬥封包裡只有 entityId 沒有怪物碼,所以名字一定要在登場時記下來。
+#
+# 這裡是純觀測:串流狀態獨立一份 (**絕不共用 _ident_streams** — 那是每條連線
+# 只追一則訊息,混進來會打斷角色 ID 綁定),只寫診斷 LOG,不碰任何統計。
+# opcode 20044 是「今天台版的值」,會隨版本變 (現有的 0x4FFF/0x4E4F 同樣風險)。
+MOB_APPEAR_TYPE = 0x4E4C          # CHANNEL_AppearingAutomaton_NTF (台版 opcode 20044)
+MOB_APPEAR_MAGIC = struct.pack("<I", MOB_APPEAR_TYPE)
+MOB_MIN_SIZE = 32                 # 太小的多半是對錯位撞出來的假標頭
+MOB_MAX_SIZE = 1 << 18
+MOB_PLAIN_MAX = 1 << 16           # 解壓後保留上限 (只是拿來掃哨兵,不必無限吃)
+MOB_STREAM_MAX = 8                # 同時追蹤幾條連線的「收到一半的登場包」
+MOB_SEEN_MAX = 256                # 記住幾隻已印過的怪 (避免同一隻反覆洗版)
+MOB_LOG_MAX = 300                 # 詳細行總量上限,超過只留累計數字
+MOB_TALLY_EVERY = 20              # 每收幾則登場包印一次累計
+MOB_NAME_FILE = "notice_monster_names_tw.json"
+MOB_HEAD_SENTINEL = b"\x03\x00\x00\x00"   # 前哨
+MOB_TAIL_SENTINEL = b"\x00\x00\x00\x00"   # 後哨
+# 掃到這三個一律當沒掃到,繼續往前找 (對照表裡確認過沒有這三個鍵)
+MOB_CODE_IGNORE = {"00000000", "01000000", "FFFFFFFF"}
 DISCORD_INVITE_URL = "https://discord.gg/NaddqvBVvb"
 # 日誌欄位布局: \t [傷害值 (右對齊)] \t [標籤 (左對齊)] \t [技能名稱 (可往右溢出)]
 # 行首那個 tab 是必要的 — Tk 的 right tab stop 對齊的是「tab 之後到下一個 tab」的字,
@@ -241,6 +278,35 @@ def get_external_path(filename):
         return target
 
     return os.path.join(os.path.dirname(sys.executable), filename)
+
+
+def load_monster_names():
+    """讀怪物碼 → 名字對照表 (5,743 筆,鍵是 8 字元大寫 hex)。
+
+    只有開發者模式的怪物探針用得到,讀不到就整個功能靜默關閉。
+    原始碼佈局下檔案還放在 Note/Ref/,所以多找一層。
+    """
+    tried = set()
+    for path in (get_external_path(MOB_NAME_FILE),
+                 get_resource_path(MOB_NAME_FILE),
+                 os.path.join(os.path.dirname(os.path.dirname(
+                     os.path.abspath(__file__))), "Note", "Ref", MOB_NAME_FILE)):
+        if path in tried:
+            continue
+        tried.add(path)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict):
+            # 比對大小寫不敏感 → 統一存大寫鍵
+            return {str(k).upper(): str(v) for k, v in data.items()}
+    return {}
+
+
+# 發布版沒有診斷 LOG 的 UI 入口,不必花時間 parse 200KB JSON
+MONSTER_NAMES = {} if RELEASE_BUILD else load_monster_names()
 
 
 def load_skill_config():
@@ -534,7 +600,8 @@ def _is_never_game_traffic(name):
 
 
 IP_FILTER_NET = "43.0.0.0/8"
-HIGHLIGHT_OPTIONS = ["無", "爆擊", "強擊", "破防", "無防備", "連擊", "多重打擊", "追擊"]
+HIGHLIGHT_OPTIONS = ["無", "爆擊", "強擊", "破防", "無防備", "連擊", "多重打擊", "追擊",
+                     "迎擊"]
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")
@@ -603,6 +670,8 @@ class LiveDamageMonitor:
         # 攔截執行緒獨立於「開始/停止」— 換地圖時的 0x4FFF/0x4E4F 一輩子只送那一次,
         # 沒在收就永遠錯過,所以程式一啟動就開始收 (見 _ensure_sniffer)。
         self._ident_reset()
+        # 怪物登場包探針狀態 (見 _mob_reset / _mob_scan) — 與身分偵測完全分離
+        self._mob_reset()
         # 攔截執行緒世代編號:換網卡時 +1,舊執行緒下一個封包就自行退出
         self._sniff_gen = 0
 
@@ -2566,12 +2635,17 @@ class LiveDamageMonitor:
     def _format_skill_detail(self, sids):
         """把多個 skill_id 的命中次數與各標籤次數合計,格式化為顯示字串。
         沒有命中資料時回傳「(無資料)」。
+        覆蓋率分母與上方看板同一套規則:爆擊排除 DoT,其餘標籤再排除持續傷害。
         """
         view = self._view()
         hits = 0
+        cov_hits = 0   # 爆擊分母
+        cov_main = 0   # 強擊/連擊/追擊分母
         counts = {name: 0 for name in COVERAGE_TAGS}
         for sid in sids:
             hits += view["skill_hits"].get(sid, 0)
+            cov_hits += view["skill_cov_hits"].get(sid, 0)
+            cov_main += view["skill_cov_main"].get(sid, 0)
             per = view["skill_tags"].get(sid, {})
             for tag_name in counts:
                 counts[tag_name] += per.get(tag_name, 0)
@@ -2580,8 +2654,21 @@ class LiveDamageMonitor:
         # 顯示順序沿用既有的 強擊 → 連擊 → 爆擊,新標籤接在後面
         order = ("強擊", "連擊", "爆擊") + tuple(
             n for n in COVERAGE_TAGS if n not in ("強擊", "連擊", "爆擊"))
-        parts = [f"{name}率 {counts[name] * 100 / hits:.1f}%" for name in order]
-        return "  " + "  |  ".join(parts) + f"    (共 {hits} 次)"
+        if cov_hits == 0:
+            # 全部都是 DoT → 覆蓋率無意義,只報次數
+            return f"  (全為 DoT,不計覆蓋率)    (共 {hits} 次)"
+        parts = []
+        for name in order:
+            den = cov_hits if name in COVERAGE_TAGS_SUSTAIN else cov_main
+            # 整段技能都是持續傷時 den = 0 → 該項無意義,顯示「—」而不是 0%
+            parts.append(f"{name}率 —" if den == 0
+                         else f"{name}率 {counts[name] * 100 / den:.1f}%")
+        tail = f"    (共 {hits} 次"
+        if cov_hits != hits:
+            tail += f",DoT {hits - cov_hits} 次不計"
+        if cov_main != cov_hits:
+            tail += f",間接 {cov_hits - cov_main} 次只計爆擊"
+        return "  " + "  |  ".join(parts) + tail + ")"
 
     def dev_log_startup_hints(self):
         """啟動時先把環境狀況寫進診斷 LOG,底部區塊一開始就有東西可看。"""
@@ -2596,6 +2683,11 @@ class LiveDamageMonitor:
             bound = ("0x%08X" % self.ident_self_entity
                      if self.ident_self_entity is not None else "未綁定")
             self.dev_log(f"[ID] 目前身分: 帳號碼={acc} 角色索引={idx} | 自己 = {bound}")
+        if MONSTER_NAMES:
+            self.dev_log(f"[MOB] 怪物名對照表已載入 {len(MONSTER_NAMES):,} 筆 — "
+                         f"0x{MOB_APPEAR_TYPE:04X} 登場包探針啟用 (純觀測,不進統計)")
+        elif not RELEASE_BUILD:
+            self.dev_log(f"[MOB] 找不到 {MOB_NAME_FILE},怪物名探針關閉")
 
     # ================================================
     # 攻擊事件日誌
@@ -2707,10 +2799,14 @@ class LiveDamageMonitor:
         """
         return {
             "damage": 0,                                  # 累積傷害
-            "hits": 0,                                    # 命中筆數 (覆蓋率分母)
+            "hits": 0,                                    # 命中筆數 (含 DoT)
+            "cov_hits": 0,                                # 爆擊覆蓋率分母 (排除 DoT)
+            "cov_main": 0,                                # 強擊/連擊/追擊分母 (再排除持續傷)
             "tags": {name: 0 for name in COVERAGE_TAGS},  # 各標籤出現次數
             "skill_damage": {},                           # skill_id → 傷害
             "skill_hits": {},                             # skill_id → 命中次數
+            "skill_cov_hits": {},                         # skill_id → 非 DoT 命中次數
+            "skill_cov_main": {},                         # skill_id → 再排除持續傷的次數
             "skill_tags": {},                             # skill_id → {tag: 次數}
             "first": None,                                # 首筆時間 (DPS 用)
             "last": None,                                 # 末筆時間
@@ -2822,13 +2918,21 @@ class LiveDamageMonitor:
     def update_coverage(self):
         """更新 COVERAGE_TAGS 各項覆蓋率顯示。樣本不足 COVERAGE_MIN_HITS 時維持「—」。"""
         b = self._view()
-        if b["hits"] < COVERAGE_MIN_HITS:
-            for lbl in self.lbl_cov.values():
-                lbl.configure(text="—")
-            return
+        # 分母排除 DoT (不觸發任何標籤);強擊/連擊/追擊 再排除持續傷害。
+        # 兩個分母各自判斷樣本數 —— 打法偏持續傷時,爆擊率可能已經夠樣本,
+        # 強擊率卻還沒收滿 COVERAGE_MIN_HITS,這時只有後者顯示「—」。
         for tag_name, lbl in self.lbl_cov.items():
-            pct = b["tags"][tag_name] * 100 / b["hits"]
-            lbl.configure(text=f"{pct:.1f}%")
+            den = self._cov_den(b, tag_name)
+            if den < COVERAGE_MIN_HITS:
+                lbl.configure(text="—")
+            else:
+                lbl.configure(text=f"{b['tags'][tag_name] * 100 / den:.1f}%")
+
+    @staticmethod
+    def _cov_den(b, tag_name):
+        """該標籤的覆蓋率分母:爆擊用 cov_hits (只排除 DoT),
+        其餘標籤用 cov_main (再排除持續傷害)。"""
+        return b["cov_hits"] if tag_name in COVERAGE_TAGS_SUSTAIN else b["cov_main"]
 
     def update_dps(self):
         b = self._view()
@@ -3152,6 +3256,215 @@ class LiveDamageMonitor:
                         f"命中 {hits} 筆")
         self._ident_appear_cache.clear()
 
+    # ================================================
+    # 怪物登場包探針 (0x4E4C) — 只寫診斷 LOG,不進統計
+    # ================================================
+
+    def _mob_reset(self):
+        """清空探針狀態。與身分偵測分開,免得互相干擾。"""
+        self._mob_streams = collections.OrderedDict()   # 連線 key → 進行中的訊息
+        self._mob_seen = collections.OrderedDict()      # entityId → 已印過的怪物碼
+        self._mob_lines = 0        # 已印的詳細行數 (上限 MOB_LOG_MAX)
+        self._mob_n_msg = 0        # 收到幾則「完整收齊」的登場包
+        self._mob_n_named = 0      # 掃到碼且查得到名字
+        self._mob_n_unknown = 0    # 掃到碼但查不到 — 分辨「本來就沒名字」vs「取碼取錯」
+        self._mob_n_nocode = 0     # 解壓成功但掃不到碼
+        self._mob_n_broken = 0     # 解壓中斷 (不做 TCP 重組,重傳/亂序就斷)
+        self._mob_n_round2 = 0     # 第一輪沒中、第二輪(只認前哨)卻查到名字的次數
+
+    def _mob_log(self, msg):
+        self.root.after(0, lambda m=msg: self.dev_log(m))
+
+    def _mob_note(self, msg):
+        """詳細行有上限 — 一場幾十隻怪,不設限會把其他診斷洗掉。"""
+        self._mob_lines += 1
+        if self._mob_lines <= MOB_LOG_MAX:
+            self._mob_log(msg)
+        elif self._mob_lines == MOB_LOG_MAX + 1:
+            self._mob_log(f"[MOB] 詳細行已達 {MOB_LOG_MAX} 行上限,之後只印累計")
+
+    def _mob_tally(self):
+        self._mob_log(f"[MOB] 累計 登場{self._mob_n_msg} | 有名{self._mob_n_named} "
+                      f"查無此碼{self._mob_n_unknown} 掃不到碼{self._mob_n_nocode} "
+                      f"斷流{self._mob_n_broken} | 第二輪可疑{self._mob_n_round2}")
+
+    def _mob_scan(self, payload, key):
+        """探針入口 — 任何例外都不得影響其他解析。"""
+        try:
+            self._mob_walk(payload, key)
+        except Exception:
+            pass
+
+    def _mob_walk(self, payload, key):
+        """在 TCP 位元組流裡找 0x4E4C 的 9-byte 標頭並接續 body。
+
+        結構與 _ident_walk 相同但狀態完全分開。這裡不做「跳過已知訊息」的最佳化,
+        所以掃描範圍含別種訊息的壓縮 body — 假標頭靠 enc/size 檢查與解壓失敗擋掉,
+        擋不掉的也只是多印一行診斷。
+        """
+        n = len(payload)
+        pos = 0
+        # 1. 前面的位元組若屬於還沒收完的登場包,先交給它
+        st = self._mob_streams.get(key)
+        if st is not None:
+            take = min(st["need"], n)
+            self._mob_feed(key, payload[:take])
+            pos = take
+        # 2. 剩下的位元組繼續找下一則登場包的標頭
+        while pos + 9 <= n:
+            cand = payload.find(MOB_APPEAR_MAGIC, pos)
+            if cand < 0 or cand + 9 > n:
+                return
+            size = struct.unpack("<i", payload[cand+4:cand+8])[0]
+            enc = payload[cand+8]
+            if enc != 1 or not (MOB_MIN_SIZE <= size <= MOB_MAX_SIZE):
+                pos = cand + 1        # 對錯位撞出來的假標頭,往後挪 1 byte 重找
+                continue
+            self._mob_open(key, size, payload[cand+9:cand+9+size])
+            pos = cand + 9 + size     # 訊息跨段時 pos > n,迴圈結束,剩下的由下個封包接
+
+    def _mob_open(self, key, size, body):
+        """開一則新登場包:建串流解壓器,餵入本封包內已有的那一截。"""
+        if _BROTLI is None:
+            return
+        try:
+            dec = _BROTLI.Decompressor()
+            # 方法名在新舊版分別是 decompress / process,只挑一個
+            fn = getattr(dec, "decompress", None) or getattr(dec, "process", None)
+        except Exception:
+            fn = None
+        if fn is None:
+            return
+        st = {"size": size, "need": size, "got": 0, "fn": fn, "dec": dec,
+              "out": bytearray(), "dead": False, "done": False}
+        self._mob_streams[key] = st
+        while len(self._mob_streams) > MOB_STREAM_MAX:
+            self._mob_streams.popitem(last=False)
+        self._mob_feed(key, body)
+
+    def _mob_feed(self, key, data):
+        """把 data 當成該連線目前這則登場包的後續 body。
+
+        跟身分偵測不同,這裡**要整則解完**才有用 — 怪物碼在尾端。串流一斷就整則
+        作廢 (開頭的 entityId 拿得到也沒意義,沒有碼就查不到名字)。
+        """
+        st = self._mob_streams.get(key)
+        if st is None:
+            return
+        st["got"] += len(data)
+        st["need"] -= len(data)
+        if data and not st["dead"]:
+            try:
+                out = st["fn"](bytes(data))
+            except Exception as exc:
+                st["dead"] = True
+                self._mob_n_broken += 1
+                self._mob_note(f"[MOB] 解壓中斷 ({exc.__class__.__name__}),已收 "
+                               f"{st['got']}/{st['size']}B — 本工具不做 TCP 重組")
+                out = b""
+            if out:
+                st["out"] += out
+                if len(st["out"]) > MOB_PLAIN_MAX:
+                    st["dead"] = True
+                    self._mob_n_broken += 1
+                    self._mob_note(f"[MOB] 解壓超過 {MOB_PLAIN_MAX}B,放棄本則 "
+                                   f"(多半是撞到假標頭)")
+        if st["need"] <= 0:
+            if st["dead"]:
+                pass
+            elif self._mob_stream_incomplete(st):
+                self._mob_n_broken += 1
+                self._mob_note(f"[MOB] body 收滿 {st['size']}B 但 brotli 串流沒收尾 "
+                               f"(只解出 {len(st['out'])}B),整則作廢")
+            else:
+                self._mob_finish(st)
+            self._mob_streams.pop(key, None)
+
+    @staticmethod
+    def _mob_stream_incomplete(st):
+        """body 收滿了但解壓器還沒收尾 = 中間漏了位元組。
+
+        怪物碼在尾端,漏了就一定取不到 — 必須跟「掃不到碼」分開計數,否則分不出
+        是取碼邏輯有問題還是根本沒收完。舊版 brotli 沒有 is_finished 就當它完整。
+        """
+        fin = getattr(st["dec"], "is_finished", None)
+        try:
+            return fin is not None and not fin()
+        except Exception:
+            return False
+
+    def _mob_finish(self, st):
+        """一則登場包收完:entityId + 掃怪物碼 + 查表,寫一行診斷。"""
+        if st["done"]:
+            return
+        st["done"] = True
+        plain = bytes(st["out"])
+        self._mob_n_msg += 1
+        if len(plain) < 12:
+            self._mob_n_nocode += 1
+            self._mob_note(f"[MOB] 解壓內容只有 {len(plain)}B,不足以取碼")
+        else:
+            eid = struct.unpack("<I", plain[:4])[0]
+            if eid == 0:
+                self._mob_n_nocode += 1
+            else:
+                self._mob_report(eid, plain)
+        if self._mob_n_msg % MOB_TALLY_EVERY == 0:
+            self._mob_tally()
+
+    def _mob_report(self, eid, plain):
+        code = self._mob_find_code(plain)
+        if code is None:
+            self._mob_n_nocode += 1
+            # 第二輪(只認前哨)在台版會誤命中 — 同一個錨點位置放的是 RGBA 顏色值,
+            # 03 00 00 00 這種樣式會自然出現。這裡**不採用**,只在「它查得到名字」
+            # 時記一筆,用來估「若開第二輪會錯多少」。
+            alt = self._mob_find_code(plain, head_only=True)
+            hint = ""
+            if alt is not None and alt in MONSTER_NAMES:
+                self._mob_n_round2 += 1
+                hint = f" | 第二輪得 {alt}→{MONSTER_NAMES[alt]} (未採用)"
+            self._mob_note(f"[MOB] eid={eid} 掃不到怪物碼 (解壓 {len(plain)}B){hint}")
+            return
+        name = MONSTER_NAMES.get(code)
+        if name:
+            self._mob_n_named += 1
+        else:
+            self._mob_n_unknown += 1
+        # 同一隻 (eid + 同一個碼) 只印一次 — 登場包會重送
+        if self._mob_seen.get(eid) == code:
+            return
+        self._mob_seen[eid] = code
+        while len(self._mob_seen) > MOB_SEEN_MAX:
+            self._mob_seen.popitem(last=False)
+        if name:
+            self._mob_note(f"[MOB] eid={eid} code={code} → {name} ({eid & 0xFF})")
+        else:
+            self._mob_note(f"[MOB] eid={eid} code={code} → 查表無此碼 "
+                           f"(Monster {eid})")
+
+    @staticmethod
+    def _mob_find_code(plain, head_only=False):
+        """從尾端往前掃哨兵取 4-byte 怪物碼,回傳 8 字元大寫 hex;沒有則 None。
+
+        預設只跑第一輪 (前後哨都要對)。head_only 是第二輪,台版會誤命中,
+        只拿來對照觀察,不當結果採用。
+
+        ⚠ 回傳的是「線序 bytes 的 hex」,不是「讀成 u32 再格式化」—
+        後者會左右顛倒 (C9DEC814 變 14C8DEC9),整張表查不到而且不會報錯。
+        """
+        span = 8 if head_only else 12
+        # 下界 4:前 4 bytes 是 entityId,不可能是哨兵
+        for p in range(len(plain) - span, 3, -1):
+            if plain[p:p+4] != MOB_HEAD_SENTINEL:
+                continue
+            if not head_only and plain[p+8:p+12] != MOB_TAIL_SENTINEL:
+                continue
+            code = plain[p+4:p+8].hex().upper()
+            if code not in MOB_CODE_IGNORE:
+                return code
+        return None
+
     def parse_payload(self, payload):
         offset = 0
         payload_len = len(payload)
@@ -3199,6 +3512,10 @@ class LiveDamageMonitor:
 
                         # 持續傷害 (DoT):已確認,用於在技能名稱後加註 (Dot)
                         is_dot = any(flags[idx] & mask for idx, mask in DMG_DOT_BITS)
+                        # 遊戲敘述的「持續傷害」:額外傷害位元全亮但不是 DoT。
+                        # 用於技能名加註 (間接) 與覆蓋率分母分流 (見 DMG_SUSTAIN_BITS)
+                        is_sustain = (not is_dot) and all(
+                            flags[idx] & mask for idx, mask in DMG_SUSTAIN_BITS)
 
                         # 嘗試從後續的 0x4fc5 TLV 抽出 skill_id (可能為 None)
                         # 事件實際總長為 9 + size (標頭含 encodingType),這裡刻意用 +8 起掃:
@@ -3252,12 +3569,12 @@ class LiveDamageMonitor:
                         # 3. 標籤解析
                         #    b41: bit0=爆擊, bit2=無防備(排除破防), bit3=破防
                         #         bit6=首擊(first_hit,非標籤), bit7=普通攻擊旗標(自動攻擊=1)
-                        #    b42: bit0=多重打擊, bit1=強擊, bit2=連擊
+                        #    b42: bit0=多重打擊, bit1=強擊, bit2=連擊, bit4=迎擊
                         #         bit3+bit7=持續傷害(DoT),不當標籤,改在技能名後加註 (Dot)
                         #    b44: bit3=追擊 (未驗證,見 DMG_ADD_HIT_BIT)
                         #    b57: bit0=破防 (備援旗標)
                         KNOWN_MASK_B41 = 0xCD
-                        KNOWN_MASK_B42 = 0x8F   # 原 0x07;bit3/bit7 已確認為 DoT,不再報未知
+                        KNOWN_MASK_B42 = 0x9F   # 原 0x8F;bit4 已確認為迎擊,不再報未知
 
                         tags = []
                         if b41 & 0x01:
@@ -3272,6 +3589,8 @@ class LiveDamageMonitor:
                             tags.append("連擊")
                         if b42 & 0x01:
                             tags.append("多重打擊")
+                        if b42 & 0x10:
+                            tags.append("迎擊")
                         # 追擊:位置來自 packet-protocol.md,尚未錄到本地樣本驗證
                         if flags[DMG_ADD_HIT_BIT[0]] & DMG_ADD_HIT_BIT[1]:
                             tags.append("追擊")
@@ -3298,32 +3617,49 @@ class LiveDamageMonitor:
                                 b["first"] = now
                             b["last"] = now
                             b["hits"] += 1
-                            for name in b["tags"]:
-                                if name in tags:
-                                    b["tags"][name] += 1
+                            # DoT 不會觸發爆擊/強擊/連擊/追擊 → 整筆排除在覆蓋率之外
+                            # (分子分母都不算),只保留在傷害/命中/DPS 統計裡。
+                            # 持續傷害會爆擊,但不會有強擊/連擊/追擊 → 只進爆擊的分子分母。
+                            if not is_dot:
+                                b["cov_hits"] += 1
+                                if not is_sustain:
+                                    b["cov_main"] += 1
+                                for name in b["tags"]:
+                                    if is_sustain and name not in COVERAGE_TAGS_SUSTAIN:
+                                        continue
+                                    if name in tags:
+                                        b["tags"][name] += 1
                             # 累加該技能的傷害/命中/標籤 (skill_id 抓不到就不列入排行)
                             if skill_id is not None:
                                 b["skill_damage"][skill_id] = b["skill_damage"].get(skill_id, 0) + dmg_val
                                 b["skill_hits"][skill_id] = b["skill_hits"].get(skill_id, 0) + 1
                                 per = b["skill_tags"].setdefault(
                                     skill_id, {n: 0 for n in COVERAGE_TAGS})
-                                for _tn in COVERAGE_TAGS:
-                                    if _tn in tags:
-                                        per[_tn] += 1
+                                if not is_dot:
+                                    b["skill_cov_hits"][skill_id] = b["skill_cov_hits"].get(skill_id, 0) + 1
+                                    if not is_sustain:
+                                        b["skill_cov_main"][skill_id] = b["skill_cov_main"].get(skill_id, 0) + 1
+                                    for _tn in COVERAGE_TAGS:
+                                        if is_sustain and _tn not in COVERAGE_TAGS_SUSTAIN:
+                                            continue
+                                        if _tn in tags:
+                                            per[_tn] += 1
 
                         # 只有這筆會影響到「目前顯示中的目標」時才重畫
                         if self.selected_target in (TARGET_ALL, target_id):
                             self.root.after(0, self._refresh_stats_view)
 
                         # 技能欄:優先用 skills.ini 對照,skill_id=0 標為符文,否則顯示 hex ID
-                        #        持續傷害在名稱後加註 (Dot) — DoT 旗標來自傷害事件本身,
-                        #        與 skill_id 是否取得無關,所以兩種情況都要加。
+                        #        DoT 加註 (Dot)、持續傷害加註 (間接) — 兩者旗標都來自
+                        #        傷害事件本身,與 skill_id 是否取得無關,抓不到 ID 一樣要加。
                         if skill_id is None:
                             skill_display = "?" * 10
                         else:
                             skill_display = format_skill_name(skill_id)
                         if is_dot:
                             skill_display += DMG_DOT_SUFFIX
+                        elif is_sustain:
+                            skill_display += DMG_SUSTAIN_SUFFIX
                         # tab 分隔欄位,tab stop 已在初始化時設定於固定像素位置。
                         # 行首多一個 tab:傷害值靠第一個 (right) 停靠點右對齊,
                         # 不再補空白 — 補空白只在等寬字體下才對得齊。
@@ -3594,9 +3930,11 @@ class LiveDamageMonitor:
         # 0x4FFF/0x4E4F 只送一次,錯過就要等下次換圖,所以一律掃。
         # 訊息 body 跨封包接續,所以要依連線分流 — 混到別條連線的位元組會把串流解壓弄壞。
         ip_layer, tcp_layer = packet[IP], packet[TCP]
-        self._scan_identity(raw_payload,
-                            (ip_layer.src, tcp_layer.sport,
-                             ip_layer.dst, tcp_layer.dport))
+        conn_key = (ip_layer.src, tcp_layer.sport, ip_layer.dst, tcp_layer.dport)
+        self._scan_identity(raw_payload, conn_key)
+        # 怪物登場包探針:純觀測,只在開發版且對照表讀得到時才跑
+        if self.is_dev_mode and MONSTER_NAMES:
+            self._mob_scan(raw_payload, conn_key)
         if not self.is_monitoring:
             return
         if self.track_damage:
