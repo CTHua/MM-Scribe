@@ -252,6 +252,10 @@ def get_resource_path(filename):
     return os.path.join(base, filename)
 
 
+IS_WINDOWS = sys.platform.startswith("win")
+IS_MACOS = sys.platform == "darwin"
+
+
 def check_npcap_installed():
     """檢查系統是否安裝 Npcap / WinPcap。
     透過檢查關鍵 DLL 檔案是否存在於系統目錄。
@@ -264,6 +268,87 @@ def check_npcap_installed():
         r"C:\Windows\SysWOW64\wpcap.dll",
     ]
     return any(os.path.exists(p) for p in candidates)
+
+
+def list_bpf_devices():
+    """列出 macOS/BSD 的 BPF 裝置節點 (/dev/bpf0, /dev/bpf1, ...)。"""
+    try:
+        return sorted(n for n in os.listdir("/dev") if n.startswith("bpf"))
+    except OSError:
+        return []
+
+
+def check_capture_permission():
+    """目前的執行身分是否具備抓包權限。
+    回傳 (ok: bool, detail: str)。
+    - Windows: 需要系統管理員 (Npcap 驅動要求)
+    - macOS/BSD: 需要能開啟 /dev/bpf* — root,或使用者屬於 access_bpf 群組
+    """
+    if IS_WINDOWS:
+        try:
+            import ctypes
+            return bool(ctypes.windll.shell32.IsUserAnAdmin()), "系統管理員"
+        except Exception as e:
+            return False, f"無法判定管理員身分: {type(e).__name__}"
+
+    if os.geteuid() == 0:
+        return True, "root"
+
+    devices = list_bpf_devices()
+    if not devices:
+        return False, "找不到任何 /dev/bpf* 裝置"
+    # scapy 以 O_RDWR 開啟 BPF,權限檢查必須用同樣的模式,否則會誤判成可用
+    for name in devices:
+        try:
+            fd = os.open(os.path.join("/dev", name), os.O_RDWR)
+        except OSError:
+            continue
+        os.close(fd)
+        return True, f"/dev/{name} 可讀寫"
+    return False, f"{len(devices)} 個 /dev/bpf* 裝置都無法開啟"
+
+
+def check_capture_driver():
+    """抓包驅動是否就緒。回傳 (ok: bool, detail: str)。
+    Windows 要另外安裝 Npcap;macOS 的 BPF 內建於系統。
+    """
+    if IS_WINDOWS:
+        if check_npcap_installed():
+            return True, "Npcap 驅動已安裝"
+        return False, "未偵測到 Npcap 驅動"
+
+    devices = list_bpf_devices()
+    if devices:
+        return True, f"系統內建 BPF ({len(devices)} 個裝置節點)"
+    return False, "找不到 /dev/bpf* 裝置"
+
+
+def list_network_ifaces():
+    """跨平台列出網路介面,統一成 get_windows_if_list() 的 dict 形狀。
+
+    每個項目含 name / description / guid / ips,下游的 extract_ipv4_list()
+    與 is_active_iface() 因此不必分平台處理。
+    Windows 沿用 scapy 的 get_windows_if_list();其他平台改讀 conf.ifaces,
+    因為 scapy.arch.windows 依賴 winreg,在 macOS 匯入就會 ModuleNotFoundError。
+    """
+    if IS_WINDOWS:
+        from scapy.arch.windows import get_windows_if_list
+        return get_windows_if_list()
+
+    # 從 scapy.all 取 conf:只匯入 scapy.config 時 conf.ifaces 還沒被填
+    from scapy.all import conf
+    out = []
+    for iface in (conf.ifaces or {}).values():
+        name = str(getattr(iface, "name", "") or "")
+        if not name:
+            continue
+        out.append({
+            "name": name,
+            "description": str(getattr(iface, "description", "") or name),
+            "guid": "",
+            "ips": dict(getattr(iface, "ips", {}) or {}),
+        })
+    return out
 IP_FILTER_NET = "43.0.0.0/8"
 HIGHLIGHT_OPTIONS = ["無", "爆擊", "強擊", "破防", "無防備", "連擊", "多重打擊"]
 
@@ -1073,7 +1158,6 @@ class LiveDamageMonitor:
         """
         def _worker():
             try:
-                from scapy.arch.windows import get_windows_if_list
                 from scapy.all import sniff as _sniff
 
                 def _extract_ipv4(raw):
@@ -1090,7 +1174,7 @@ class LiveDamageMonitor:
                             and not str(ip).startswith("169.254.")]
 
                 try:
-                    raw_ifs = get_windows_if_list()
+                    raw_ifs = list_network_ifaces()
                 except Exception as e:
                     self.root.after(0, lambda err=e: on_progress(
                         "warn", f"無法列出介面: {err}"))
@@ -1232,27 +1316,32 @@ class LiveDamageMonitor:
         def section(title):
             area._textbox.insert("end", f"── {title} ──\n\n", "tag_header")
 
-        # === 1. 管理員權限 ===
+        # === 1. 抓包權限 ===
         section("1. 執行權限")
-        is_admin = False
-        try:
-            is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
-        except Exception:
-            pass
-        if is_admin:
-            write("ok", "以系統管理員身分執行", "scapy sniff 具備所需權限")
-        else:
+        has_permission, permission_detail = check_capture_permission()
+        if has_permission:
+            write("ok", f"抓包權限正常 ({permission_detail})",
+                  "scapy sniff 具備所需權限")
+        elif IS_WINDOWS:
             write("fail", "非系統管理員權限",
                   "★ 這是抓不到封包最常見的原因 ★",
                   "請關閉程式後對 exe 右鍵 → 「以系統管理員身分執行」")
-
-        # === 2. Npcap ===
-        section("2. Npcap 驅動")
-        if check_npcap_installed():
-            write("ok", "Npcap 驅動已安裝")
         else:
-            write("fail", "未偵測到 Npcap 驅動",
+            write("fail", f"無法存取 BPF 裝置 ({permission_detail})",
+                  "★ 這是抓不到封包最常見的原因 ★",
+                  "用 sudo 執行,或把自己加入 access_bpf 群組後重新登入")
+
+        # === 2. 抓包驅動 ===
+        section("2. 抓包驅動")
+        driver_ok, driver_detail = check_capture_driver()
+        if driver_ok:
+            write("ok", driver_detail)
+        elif IS_WINDOWS:
+            write("fail", driver_detail,
                   "請至 https://npcap.com/ 下載並安裝")
+        else:
+            write("fail", driver_detail,
+                  "系統應內建 BPF,請確認 /dev 是否可讀取")
 
         # ── 共用工具 ──
         def extract_ipv4_list(raw):
@@ -1308,8 +1397,7 @@ class LiveDamageMonitor:
         # === 3. 網路介面 ===
         section("3. 網路介面偵測 (已過濾無 IPv4 的介面)")
         try:
-            from scapy.arch.windows import get_windows_if_list
-            ifs = get_windows_if_list()
+            ifs = list_network_ifaces()
             if not ifs:
                 write("warn", "沒有找到任何網路介面")
             else:
@@ -1343,14 +1431,13 @@ class LiveDamageMonitor:
         # === 4. scapy 目前綁定的介面 ===
         section("4. scapy 目前綁定介面")
         try:
-            from scapy.arch.windows import get_windows_if_list
             friendly = active_name
             desc = ""
             ipv4 = extract_ipv4_list(getattr(active_iface, "ips", None)) if active_iface_str else []
 
             # 沒抓到就從介面清單反查
             if active_iface_str and (not friendly or not ipv4):
-                for iface in get_windows_if_list():
+                for iface in list_network_ifaces():
                     if is_active_iface(iface):
                         if not friendly:
                             friendly = str(iface.get("description") or iface.get("name") or "")
