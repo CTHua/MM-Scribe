@@ -35,9 +35,12 @@ import webbrowser
 import customtkinter as ctk
 from scapy.all import sniff, TCP, IP
 
-# Brotli 為「選用」相依 — 只有開發者模式的封包普查會用到 (encodingType==1 的
-# content 是 Brotli,見 protocol §1)。沒安裝時普查照跑,只是看不到解壓內容,
-# 其餘功能完全不受影響,因此不列入打包硬相依。
+# Brotli 是**必要**相依,不是選用的。角色身分偵測 (見 PacketNotes_Identity) 讀的
+# 0x4FFF / 0x4E4F 兩則訊息都是 encodingType==1,也就是 Brotli;解不開就綁不到自己的
+# 實體 ID,而傷害統計又以「攻擊者 == 自己」為門檻 (同筆記 §9) —— 結果是一筆傷害都
+# 不會記,UI 上只看得到紅字「尚未偵測到角色ID」。
+# 這裡仍然用 try/except 匯入,是為了讓缺套件時能給出一句講得清楚的錯誤訊息,
+# 而不是開機就 ImportError 掛掉。缺套件的後果由 IDENT_MSG_NO_BROTLI 說明。
 try:
     import brotli as _BROTLI
 except ImportError:
@@ -184,6 +187,11 @@ IDENT_STREAM_MAX = 8              # 同時追蹤幾條 TCP 連線的「收到一
 # 所以這行要直接出現在使用者天天在看的日誌上,不能只留在開發者面板。
 IDENT_MSG_NONE = "尚未偵測到角色ID，請嘗試更換地圖或重新登入來獲取角色ID"
 IDENT_MSG_OK = "已獲得角色ID資訊"
+# 缺 brotli 時走這句。沿用上面那句的話會叫使用者去換地圖,而換幾次都不會好 —
+# 訊息本身把人導向錯的方向,比沒有訊息更糟。
+IDENT_MSG_NO_BROTLI = ("缺少 brotli 套件，無法偵測角色ID（傷害統計因此不會記錄）。"
+                       "原始碼版請執行 pip install Brotli==1.1.0；"
+                       "打包版請改用有內含 brotli 的新版本")
 # 「⚡ 強制偵測」旁的 ? 提示 (見 toggle_force_all)
 FORCE_ALL_TIP = ("無視角色 ID 偵測,把所有解析到的傷害全部納入統計。\n"
                  "包含隊友、寵物、敵人打的傷害,數據不再只屬於你自己。\n"
@@ -3115,7 +3123,8 @@ class LiveDamageMonitor:
         if self._ident_no_id_logged:
             return
         self._ident_no_id_logged = True
-        self.root.after(0, lambda: self.log_error(IDENT_MSG_NONE))
+        msg = IDENT_MSG_NONE if _BROTLI is not None else IDENT_MSG_NO_BROTLI
+        self.root.after(0, lambda m=msg: self.log_error(m))
 
     def _ident_status_line(self):
         """啟動 / 按「開始」/ 按「清除」時的狀態提示 (主執行緒)。
@@ -3125,7 +3134,7 @@ class LiveDamageMonitor:
             return          # 強制偵測下傷害照收,沒有角色 ID 也不是問題
         if self.ident_self_entity is None:
             self._ident_no_id_logged = True
-            self.log_error(IDENT_MSG_NONE)
+            self.log_error(IDENT_MSG_NONE if _BROTLI is not None else IDENT_MSG_NO_BROTLI)
 
     def _scan_identity(self, payload, key=None):
         """身分偵測入口 — 任何例外都不得影響其他解析。

@@ -13,7 +13,7 @@ if [[ ! -x "$VENV_PY" ]]; then
 找不到虛擬環境,請先建立:
 
     uv venv --python 3.12 .venv
-    uv pip install --python .venv/bin/python scapy==2.7.0 customtkinter==5.2.2
+    uv pip install --python .venv/bin/python scapy==2.7.0 customtkinter==5.2.2 Brotli==1.1.0
 
 EOF
     exit 1

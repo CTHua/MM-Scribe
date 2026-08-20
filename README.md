@@ -43,14 +43,14 @@
 - Windows 10 / 11
 - [Npcap](https://npcap.com/) 驅動
 - 系統管理員權限（scapy 抓包需要）
-- 原始碼版另需 Python 3.x 與相依套件：`customtkinter`、`scapy`
+- 原始碼版另需 Python 3.x 與相依套件：`customtkinter`、`scapy`、`Brotli`
 
 ### macOS
 
 - macOS 13 以上，**Apple Silicon**（遊戲本身是 iOS App on Mac，無法在 Intel Mac 上執行）
 - libpcap 為系統內建，**不需要**安裝 Npcap 之類的驅動
 - 抓包需要 BPF 裝置權限（見下方使用說明）
-- 原始碼版另需 Python 3.12 與相依套件：`customtkinter`、`scapy`
+- 原始碼版另需 Python 3.12 與相依套件：`customtkinter`、`scapy`、`Brotli`
 
 遊戲在 macOS 上是透過 App Store 安裝的 **iOS App on Mac**，
 封包直接走實體網卡，不需要模擬器、網路共享或任何轉送設定。
@@ -139,7 +139,7 @@ sudo "/Applications/MM Scribe.app/Contents/MacOS/MM Scribe"
 
 ```bash
 uv venv --python 3.12 .venv
-uv pip install --python .venv/bin/python scapy==2.7.0 customtkinter==5.2.2
+uv pip install --python .venv/bin/python scapy==2.7.0 customtkinter==5.2.2 Brotli==1.1.0
 ./run-macos.sh
 ```
 
