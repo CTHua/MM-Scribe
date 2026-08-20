@@ -478,6 +478,18 @@ def format_skill_name(skill_id):
     return SKILL_NAMES.get(skill_id) or f"0x{skill_id:08X}"
 
 
+def list_bpf_devices():
+    """列出系統上所有 /dev/bpf* 裝置節點,依編號排序。
+    scapy 的 get_dev_bpf() 會一路試到 /dev/bpf255,所以這裡也不能只看前幾個 —
+    只掃 bpf0~3 的話,前幾個裝置被其他程式佔用時會誤判成「沒有權限」。
+    """
+    try:
+        names = [n for n in os.listdir("/dev") if n.startswith("bpf") and n[3:].isdigit()]
+    except OSError:
+        return []
+    return sorted(names, key=lambda n: int(n[3:]))
+
+
 def check_capture_backend():
     """檢查抓封包所需的底層驅動是否就緒。
     - Windows: 需安裝 Npcap / WinPcap,檢查關鍵 DLL 是否存在
@@ -499,7 +511,8 @@ def check_capture_backend():
     if IS_MACOS:
         # libpcap 自 macOS 11 起收進 dyld shared cache,檔案系統上看不到,
         # 因此不驗證 dylib,只確認 BPF 裝置節點存在 (權限另由 check_capture_permission 判斷)
-        if any(os.path.exists(f"/dev/bpf{i}") for i in range(4)):
+        devices = list_bpf_devices()
+        if devices:
             return True, ""
         return False, "系統找不到 /dev/bpf* 裝置節點"
 
@@ -525,10 +538,8 @@ def check_capture_permission():
     if IS_MACOS:
         if os.geteuid() == 0:
             return True, "以 root 執行,具備 BPF 存取權限"
-        for i in range(4):
-            path = f"/dev/bpf{i}"
-            if not os.path.exists(path):
-                continue
+        for name in list_bpf_devices():
+            path = os.path.join("/dev", name)
             try:
                 # 必須用 O_RDWR:scapy 的 get_dev_bpf() 就是這樣開的。
                 # 只用 O_RDONLY 測的話,權限若設成唯讀會誤判為可用,
@@ -557,21 +568,37 @@ def list_network_ifaces():
         from scapy.arch.windows import get_windows_if_list
         return list(get_windows_if_list())
 
+    from scapy.config import conf
+    all_ifaces = list((conf.ifaces or {}).values())
+
+    # get_working_ifaces() 會逐張做 IFF_UP + BIOCSETIF 探測,能濾掉一堆掃了也是白掃的
+    # 虛擬介面,所以優先用它。但它的判定完全交給平台 provider,遇上探測失敗就會
+    # 整份空掉 — 那時得退回未過濾的 conf.ifaces,否則掃描階段會直接報「沒有可掃描的介面」。
+    ifaces = []
     try:
         from scapy.interfaces import get_working_ifaces
-        ifaces = get_working_ifaces()
-    except ImportError:
-        from scapy.config import conf
-        ifaces = list(conf.ifaces.values())
+        ifaces = list(get_working_ifaces())
+    except Exception:
+        ifaces = []
+    if not ifaces:
+        ifaces = all_ifaces
 
     out = []
     for itf in ifaces:
-        ip = getattr(itf, "ip", None)
         name = getattr(itf, "name", None) or str(itf)
+        # 一張介面可能掛多個 IPv4 (例如 en0 同時有 DHCP 位址與手動位址),
+        # 只取 .ip 的話,主位址剛好是空的就會被下游的 IPv4 過濾整張丟掉。
+        ips = []
+        for ip in (getattr(itf, "ips", None) or {}).get(4, []) or []:
+            if ip and ip not in ips:
+                ips.append(str(ip))
+        primary = getattr(itf, "ip", None)
+        if primary and str(primary) not in ips:
+            ips.insert(0, str(primary))
         out.append({
             "name": name,
             "description": getattr(itf, "description", None) or name,
-            "ips": [ip] if ip else [],
+            "ips": ips,
         })
     return out
 
