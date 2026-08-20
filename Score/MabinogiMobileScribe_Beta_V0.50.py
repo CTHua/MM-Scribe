@@ -2496,6 +2496,7 @@ class LiveDamageMonitor:
 
         # 詳細統計:字體與技能列 name 相同 (12pt),展開時才 pack
         detail_lbl = ctk.CTkLabel(container, text="", anchor="w",
+                                   justify="left",
                                    font=(FONT_UI, 12),
                                    text_color="#88ccff")
 
@@ -2641,22 +2642,37 @@ class LiveDamageMonitor:
         hits = 0
         cov_hits = 0   # 爆擊分母
         cov_main = 0   # 強擊/連擊/追擊分母
+        # split["dir"/"ind"] = [傷害合計, 次數, 最小, 最大]
+        split = {}
         counts = {name: 0 for name in COVERAGE_TAGS}
         for sid in sids:
             hits += view["skill_hits"].get(sid, 0)
             cov_hits += view["skill_cov_hits"].get(sid, 0)
             cov_main += view["skill_cov_main"].get(sid, 0)
+            for kind, e in view["skill_split"].get(sid, {}).items():
+                acc = split.get(kind)
+                if acc is None:
+                    split[kind] = list(e)
+                else:
+                    acc[0] += e[0]
+                    acc[1] += e[1]
+                    acc[2] = min(acc[2], e[2])
+                    acc[3] = max(acc[3], e[3])
             per = view["skill_tags"].get(sid, {})
             for tag_name in counts:
                 counts[tag_name] += per.get(tag_name, 0)
         if hits == 0:
             return "  (無資料)"
+        # 傷害行:平均/最小/最大 —— 分母用該分類自己的次數 (含 DoT),
+        # 「綜合」的次數即上一行的「共 N 次」。
+        # 偵測到間接傷害時才拆成 綜合/直傷/間傷 三行,否則維持單行。
+        dmg_lines = self._format_dmg_lines(split)
         # 顯示順序沿用既有的 強擊 → 連擊 → 爆擊,新標籤接在後面
         order = ("強擊", "連擊", "爆擊") + tuple(
             n for n in COVERAGE_TAGS if n not in ("強擊", "連擊", "爆擊"))
         if cov_hits == 0:
             # 全部都是 DoT → 覆蓋率無意義,只報次數
-            return f"  (全為 DoT,不計覆蓋率)    (共 {hits} 次)"
+            return (f"  (全為 DoT,不計覆蓋率)    (共 {hits} 次)\n" + dmg_lines)
         parts = []
         for name in order:
             den = cov_hits if name in COVERAGE_TAGS_SUSTAIN else cov_main
@@ -2668,7 +2684,37 @@ class LiveDamageMonitor:
             tail += f",DoT {hits - cov_hits} 次不計"
         if cov_main != cov_hits:
             tail += f",間接 {cov_hits - cov_main} 次只計爆擊"
-        return "  " + "  |  ".join(parts) + tail + ")"
+        return "  " + "  |  ".join(parts) + tail + ")\n" + dmg_lines
+
+    @staticmethod
+    def _format_dmg_lines(split):
+        """把 {"dir"/"ind": [傷害合計, 次數, 最小, 最大]} 排成傷害統計行。
+        沒有間接傷害 → 單行 (不加分類前綴);有 → 綜合/直傷/間傷 三行。
+        """
+        def _row(prefix, dmg, n, mn, mx, total=False):
+            cells = [
+                f"平均傷害 {dmg / n:,.0f}",
+                f"最小傷害 {mn:,}",
+                f"最大傷害 {mx:,}",
+            ]
+            # 綜合的總傷害就是排行條上的數字,不重複顯示
+            if total:
+                cells.append(f"總傷害 {dmg:,}")
+            return prefix + "  |  ".join(cells)
+
+        d = split.get("dir")
+        i = split.get("ind")
+        if i is None:
+            return "  " if d is None else _row("  ", *d)
+        if d is None:
+            # 整段技能都是間接傷害 → 綜合等於間傷,不必重複三行
+            return _row("  (間傷)  ", *i, total=True)
+        both = (d[0] + i[0], d[1] + i[1], min(d[2], i[2]), max(d[3], i[3]))
+        return "\n".join((
+            _row("  (綜合)  ", *both),
+            _row("  (直傷)  ", *d, total=True),
+            _row("  (間傷)  ", *i, total=True),
+        ))
 
     def dev_log_startup_hints(self):
         """啟動時先把環境狀況寫進診斷 LOG,底部區塊一開始就有東西可看。"""
@@ -2808,6 +2854,9 @@ class LiveDamageMonitor:
             "skill_cov_hits": {},                         # skill_id → 非 DoT 命中次數
             "skill_cov_main": {},                         # skill_id → 再排除持續傷的次數
             "skill_tags": {},                             # skill_id → {tag: 次數}
+            # skill_id → {"dir"/"ind": [傷害合計, 次數, 最小, 最大]}
+            #   dir = 直傷 (含 DoT),ind = 間接傷害 (is_sustain)
+            "skill_split": {},
             "first": None,                                # 首筆時間 (DPS 用)
             "last": None,                                 # 末筆時間
         }
@@ -3633,6 +3682,19 @@ class LiveDamageMonitor:
                             if skill_id is not None:
                                 b["skill_damage"][skill_id] = b["skill_damage"].get(skill_id, 0) + dmg_val
                                 b["skill_hits"][skill_id] = b["skill_hits"].get(skill_id, 0) + 1
+                                # 直傷/間傷各自累計 傷害/次數/最小/最大
+                                _sp = b["skill_split"].setdefault(skill_id, {})
+                                _e = _sp.get("ind" if is_sustain else "dir")
+                                if _e is None:
+                                    _sp["ind" if is_sustain else "dir"] = [
+                                        dmg_val, 1, dmg_val, dmg_val]
+                                else:
+                                    _e[0] += dmg_val
+                                    _e[1] += 1
+                                    if dmg_val < _e[2]:
+                                        _e[2] = dmg_val
+                                    if dmg_val > _e[3]:
+                                        _e[3] = dmg_val
                                 per = b["skill_tags"].setdefault(
                                     skill_id, {n: 0 for n in COVERAGE_TAGS})
                                 if not is_dot:
