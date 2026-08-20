@@ -120,12 +120,24 @@ NUM="${NUM%%-*}"
 [[ "$NUM" =~ ^[0-9]+(\.[0-9]+)*$ ]] \
     || die "從「${TAG}」取不出合理的版號 (得到「${NUM}」)。預期像 0.53 或 v0.53-beta-mac"
 
+# 名字不合法的話,git tag 要到最後一步才會失敗 — 那時 VERSION_STR 已經
+# commit 下去了,會留下一個沒有對應 tag 的版號 commit。先擋在這裡。
+git check-ref-format "refs/tags/${TAG}" \
+    || die "「${TAG}」不是合法的 git tag 名稱 (不能有空白、~^:?*[、連續的點等)"
+
 [[ -f "$SRC" ]] || die "找不到原始碼 ${SRC} — 這支腳本要放在專案根目錄執行"
 
 # VERSION_STR 只換數字,前後綴 (Beta / V) 原樣保留,
 # 這樣哪天從 "Beta V0.52" 改成 "V1.0" 也不必回來改腳本。
 read_version_str() {
     sed -n 's/^VERSION_STR[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$SRC" | head -1
+}
+
+# sed 的 replacement 裡 & 代表「整個 match」、\ 是跳脫字元、/ 會撞到 s/// 的分隔符。
+# NEW_VER 是從檔案裡既有的字串衍生出來的,使用者自訂前後綴時就可能帶到這些字元,
+# 不跳脫的話會把原始碼寫壞(而且是在讀回驗證之前就已經覆蓋掉了)。
+escape_sed_replacement() {
+    printf '%s' "$1" | sed -e 's/[\\&/]/\\&/g'
 }
 
 CURRENT_VER="$(read_version_str)"
@@ -140,6 +152,12 @@ step "檢查"
 git rev-parse --git-dir >/dev/null 2>&1 || die "這裡不是 git repo"
 
 CUR_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+# detached HEAD 時 --abbrev-ref 回的是字面上的 "HEAD"。不特別擋的話,
+# 下面那句 die 會建議 --branch HEAD,而那組合能通過所有檢查一路跑到 git push,
+# 等於把人導向一個更難收拾的狀態。
+if [[ "$CUR_BRANCH" == "HEAD" ]]; then
+    die "目前是 detached HEAD,不在任何分支上。先 git checkout ${BRANCH} 再發版"
+fi
 if [[ "$CUR_BRANCH" != "$BRANCH" ]]; then
     die "目前在 ${CUR_BRANCH},發版預期在 ${BRANCH}。要從這個分支發版請加 --branch ${CUR_BRANCH}"
 fi
@@ -153,7 +171,12 @@ fi
 info "工作區        : 乾淨"
 
 git ls-remote --exit-code "$REMOTE" >/dev/null 2>&1 || die "連不上遠端 ${REMOTE}"
-run git fetch --quiet "$REMOTE" --tags
+
+# 這行刻意不走 run():--dry-run 也必須真的 fetch,否則下面的 ahead/behind 是拿
+# 過期的 refs/remotes 算的,會在最需要它的落後 / 分歧情境給出全綠的假答案。
+# fetch 只寫 refs/remotes 與本機 tag,不動工作區也不動任何分支。
+echo "  \$ git fetch --quiet ${REMOTE} --tags   (--dry-run 也會執行:只更新遠端追蹤 ref)"
+git fetch --quiet "$REMOTE" --tags
 
 # tag 已存在就停手。覆蓋既有 tag 會讓已經下載過的人拿到對不上的版本,
 # 要重打得由人明確決定,腳本不代勞。
@@ -200,7 +223,13 @@ if [[ "$CURRENT_VER" == "$NEW_VER" ]]; then
 else
     info "VERSION_STR   : 「${CURRENT_VER}」→「${NEW_VER}」(會產生一個 commit)"
 fi
-info "tag           : ${TAG}  (annotated,打在 $(git rev-parse --short HEAD))"
+# 會產生版號 commit 的話,tag 落在那個還不存在的 commit 上,不是現在的 HEAD —
+# 在要求 [y/N] 的畫面上印一個 tag 不會落到的 sha 只會誤導。
+if [[ "$CURRENT_VER" == "$NEW_VER" ]]; then
+    info "tag           : ${TAG}  (annotated,打在 $(git rev-parse --short HEAD))"
+else
+    info "tag           : ${TAG}  (annotated,打在即將產生的版號 commit 上)"
+fi
 if [[ "$DO_PUSH" -eq 1 ]]; then
     info "推送          : ${REMOTE} ${BRANCH} + ${TAG} → 觸發 macOS 建置"
 else
@@ -233,7 +262,8 @@ if [[ "$CURRENT_VER" != "$NEW_VER" ]]; then
         # 順便保住原檔的權限與 inode(檔案開頭有 UTF-8 BOM,cat 不會動到)。
         TMP="$(mktemp)"
         trap 'rm -f "$TMP"' EXIT
-        sed "s/^\(VERSION_STR[[:space:]]*=[[:space:]]*\"\)[^\"]*\(\".*\)$/\1${NEW_VER}\2/" "$SRC" > "$TMP"
+        NEW_VER_ESC="$(escape_sed_replacement "$NEW_VER")"
+        sed "s/^\(VERSION_STR[[:space:]]*=[[:space:]]*\"\)[^\"]*\(\".*\)$/\1${NEW_VER_ESC}\2/" "$SRC" > "$TMP"
         cat "$TMP" > "$SRC"
         rm -f "$TMP"
         trap - EXIT
