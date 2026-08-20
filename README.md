@@ -224,6 +224,20 @@ BPF 權限時，會引導使用者做一次性設定（見使用說明第 2 點�
 
 ---
 
+## 發版
+
+版號寫在 [Source/MabinogiMobileScribe_Beta.py](Source/MabinogiMobileScribe_Beta.py) 的
+`VERSION_STR`，原始碼檔名不帶版號。發版用根目錄的 [release.sh](release.sh)：
+
+```bash
+./release.sh 0.53            # 更新版號 → commit → 打 tag → 推送 → 開 draft release
+./release.sh 0.53 --dry-run  # 先看它打算做什麼
+```
+
+流程細節與檔名調整的原因見 [RELEASING.md](RELEASING.md)。
+
+---
+
 ## 社群 / 回報問題
 
 - Discord：<https://discord.gg/NaddqvBVvb>
