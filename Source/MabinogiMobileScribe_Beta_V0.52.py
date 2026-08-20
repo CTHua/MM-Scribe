@@ -8,15 +8,15 @@ macOS 上遊戲為 iOS App on Mac,流量直接走實體網卡,抓法與 Windows 
 
 打包說明:
   Windows 開發版 (顯示開發者選項):
-    python -m PyInstaller --onefile --noconsole --collect-data customtkinter MabinogiMobileScribe_Beta_V0.50.py
+    python -m PyInstaller --onefile --noconsole --collect-data customtkinter MabinogiMobileScribe_Beta_V0.52.py
 
   Windows 發布版 (隱藏開發者選項):
     type nul > RELEASE.marker
-    python -m PyInstaller --onefile --noconsole --collect-data customtkinter --add-data "RELEASE.marker;." MabinogiMobileScribe_Beta_V0.50.py
+    python -m PyInstaller --onefile --noconsole --collect-data customtkinter --add-data "RELEASE.marker;." MabinogiMobileScribe_Beta_V0.52.py
 
   macOS (--add-data 分隔符是 ':' 不是 ';'):
     touch RELEASE.marker
-    python -m PyInstaller --windowed --collect-data customtkinter --add-data "RELEASE.marker:." MabinogiMobileScribe_Beta_V0.50.py
+    python -m PyInstaller --windowed --collect-data customtkinter --add-data "RELEASE.marker:." MabinogiMobileScribe_Beta_V0.52.py
 
   程式啟動時會偵測執行檔內是否包含 RELEASE.marker 檔案,
   存在則隱藏開發者選項按鈕(釋出給他人使用)。
@@ -81,7 +81,7 @@ def is_release_build():
 # ----------------------------------------------------
 # 設定
 # ----------------------------------------------------
-VERSION_STR = "Beta V0.50"
+VERSION_STR = "Beta V0.52"
 COVERAGE_MIN_HITS = 10  # 覆蓋率計算所需最少樣本數
 # 需要統計覆蓋率的標籤 (上方面板、技能排行展開明細共用同一份;順序即顯示順序)
 COVERAGE_TAGS = ("爆擊", "強擊", "連擊", "追擊")

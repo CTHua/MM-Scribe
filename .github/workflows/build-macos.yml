@@ -31,13 +31,13 @@ jobs:
         run: python -m pip install scapy==2.7.0 customtkinter==5.2.2 pyinstaller==6.21.0
 
       - name: 建置 .app
-        working-directory: Score
+        working-directory: Source
         run: ./MabinogiMobileScribe_BuildTool.sh
 
       # 用 ditto 而非 zip:.app 是目錄結構,ditto 才會保留 symlink 與
       # 簽章所需的 metadata,否則解壓後的 app 會打不開。
       - name: 壓縮 Release 版
-        working-directory: Score/dist
+        working-directory: Source/dist
         run: |
           SRC="$(ls -t ../MabinogiMobileScribe_*.py | head -1)"
           VER="$(basename "$SRC" .py)"
@@ -52,7 +52,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: macos-app
-          path: Score/dist/${{ env.ZIP_NAME }}
+          path: Source/dist/${{ env.ZIP_NAME }}
 
       # 有 tag 才附到 release;手動觸發時只留 artifact。
       #
@@ -61,7 +61,7 @@ jobs:
       # 沒必要為此寄一封 workflow 失敗通知。
       - name: 附加到 release
         if: startsWith(github.ref, 'refs/tags/')
-        working-directory: Score/dist
+        working-directory: Source/dist
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

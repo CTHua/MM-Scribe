@@ -150,12 +150,12 @@ uv pip install --python .venv/bin/python scapy==2.7.0 customtkinter==5.2.2
 
 ## 設定檔說明
 
-設定檔須放在 `MM Scribe.exe` 同一資料夾（或原始碼版的 [Score/](Score/) 資料夾內），修改後重啟程式生效。
+設定檔須放在 `MM Scribe.exe` 同一資料夾（或原始碼版的 [Source/](Source/) 資料夾內），修改後重啟程式生效。
 
 macOS 打包成 `.app` 之後，設定檔改放在 `~/Library/Application Support/MM Scribe/`
-（`.app` 內部不可寫，首次啟動會自動把預設檔複製過去）；直接跑原始碼時仍然是讀 [Score/](Score/)。
+（`.app` 內部不可寫，首次啟動會自動把預設檔複製過去）；直接跑原始碼時仍然是讀 [Source/](Source/)。
 
-### [skills.ini](Score/skills.ini) — 技能 ID 對照與合併群組
+### [skills.ini](Source/skills.ini) — 技能 ID 對照與合併群組
 
 ```ini
 [職業名稱]
@@ -169,7 +169,7 @@ macOS 打包成 `.app` 之後，設定檔改放在 `~/Library/Application Suppor
 - 以 `;` 或 `#` 開頭的行為註解
 - 找不到對應 ID 的技能會顯示原始 hex ID
 
-### [settings.ini](Score/settings.ini) — 顯示 / 追蹤 / 排版
+### [settings.ini](Source/settings.ini) — 顯示 / 追蹤 / 排版
 
 ```ini
 [Display]
@@ -193,14 +193,14 @@ popout_skill = false           ; 技能傷害排行獨立視窗
 **開發版**（顯示開發者選項）：
 
 ```bash
-python -m PyInstaller --onefile --noconsole --collect-data customtkinter MabinogiMobileScribe_Beta_V0.50.py
+python -m PyInstaller --onefile --noconsole --collect-data customtkinter MabinogiMobileScribe_Beta_V0.52.py
 ```
 
 **發布版**（隱藏開發者選項）：
 
 ```bash
 type nul > RELEASE.marker
-python -m PyInstaller --onefile --noconsole --collect-data customtkinter --add-data "RELEASE.marker;." MabinogiMobileScribe_Beta_V0.50.py
+python -m PyInstaller --onefile --noconsole --collect-data customtkinter --add-data "RELEASE.marker;." MabinogiMobileScribe_Beta_V0.52.py
 ```
 
 ### macOS
@@ -209,7 +209,7 @@ python -m PyInstaller --onefile --noconsole --collect-data customtkinter --add-d
 
 ```bash
 touch RELEASE.marker
-python -m PyInstaller --windowed --collect-data customtkinter --add-data "RELEASE.marker:." MabinogiMobileScribe_Beta_V0.50.py
+python -m PyInstaller --windowed --collect-data customtkinter --add-data "RELEASE.marker:." MabinogiMobileScribe_Beta_V0.52.py
 ```
 
 PyInstaller 只會做 ad-hoc 簽章（沒有 Team ID），因此 `.app` 一定會被 Gatekeeper 攔下，
